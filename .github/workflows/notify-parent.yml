@@ -1,0 +1,24 @@
+name: Notify Parent Repo
+
+on:
+  push:
+    branches:
+      - master
+
+jobs:
+  dispatch:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Trigger root monorepo build
+        uses: peter-evans/repository-dispatch@v3
+        with:
+          token: ${{ secrets.DISPATCH_TOKEN }}
+          repository: asepharyana/asepharyana-hub
+          event-type: submodule-updated
+          client-payload: |
+            {
+              "service": "llm-api",
+              "ref": "${{ github.ref }}",
+              "sha": "${{ github.sha }}",
+              "actor": "${{ github.actor }}"
+            }
