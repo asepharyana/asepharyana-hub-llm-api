@@ -1,0 +1,16 @@
+http:
+  routers:
+    llm-api:
+      rule: 'Host(`ai.asepharyana.my.id`) || Host(`ai.asepharyana.web.id`)'
+      entryPoints:
+        - websecure
+      tls: {}
+      middlewares:
+        - common-chain@file
+      service: llm-api-service
+
+  services:
+    llm-api-service:
+      loadBalancer:
+        servers:
+          - url: 'http://llm-api:8080'
