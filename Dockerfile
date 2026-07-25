@@ -1,5 +1,6 @@
-# ── Build stage: cargo-chef for dependency caching ──
-FROM lukemathwalker/cargo-chef:latest-rust-1.97.0 AS chef
+# ── Build stage: cargo-chef ──
+FROM lukemathwalker/cargo-chef:latest-rust-1.89.0 AS chef
+RUN apt-get update && apt-get install -y --no-install-recommends libclang-dev cmake && rm -rf /var/lib/apt/lists/*
 WORKDIR /app
 
 FROM chef AS planner
@@ -24,6 +25,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
     curl \
     libssl3 \
+    libgomp1 \
     && rm -rf /var/lib/apt/lists/*
 
 RUN groupadd -g 1001 appgroup && \

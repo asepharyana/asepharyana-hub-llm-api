@@ -1,6 +1,6 @@
 use axum::{
     extract::State,
-    http::StatusCode,
+    http::{HeaderMap, StatusCode},
     response::Json,
     routing::{get, post},
     Router,
@@ -9,9 +9,10 @@ use llama_cpp_2::{
     context::params::LlamaContextParams,
     llama_backend::LlamaBackend,
     llama_batch::LlamaBatch,
-    model::{params::LlamaModelParams, AddBos, LlamaModel, Special},
+    model::{params::LlamaModelParams, AddBos, LlamaModel},
     sampling::LlamaSampler,
     token::LlamaToken,
+    TokenToStringError,
 };
 use serde::{Deserialize, Serialize};
 use std::num::NonZeroU32;
@@ -132,8 +133,27 @@ struct HealthResponse {
     model: String,
 }
 
-const DEFAULT_MODEL_PATH: &str = "/root/models/gguf/MiniCPM-V-4.6-Q4_K_M.gguf";
+const DEFAULT_MODEL_PATH: &str = "/models/MiniCPM-V-4.6-Q4_K_M.gguf";
 const EOS_TOKEN: i32 = 248044;
+
+fn check_auth(headers: &HeaderMap) -> Result<(), (StatusCode, String)> {
+    let api_key = std::env::var("API_KEY").unwrap_or_default();
+    if api_key.is_empty() {
+        return Ok(()); // no key configured = open
+    }
+    let header = headers
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    let expected = format!("Bearer {api_key}");
+    if header == expected || header == api_key {
+        return Ok(());
+    }
+    Err((
+        StatusCode::UNAUTHORIZED,
+        "{\"error\":\"unauthorized\",\"message\":\"Invalid API key\"}".into(),
+    ))
+}
 
 #[tokio::main]
 async fn main() {
@@ -216,8 +236,11 @@ async fn list_models() -> Json<ModelsResponse> {
 
 async fn chat_completions(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
     Json(req): Json<ChatRequest>,
 ) -> Result<Json<ChatResponse>, (StatusCode, String)> {
+    info!("Chat: {} chars, max_tokens={:?}", req.messages.len(), req.max_tokens);
+    check_auth(&headers)?;
     let prompt = build_prompt(&req.messages);
     let max_tokens = req.max_tokens.unwrap_or(256).min(1024);
 
@@ -261,10 +284,7 @@ async fn chat_completions(
         current = inner.sample_token();
     }
 
-    let output_text = state
-        .model
-        .tokens_to_str(&output_tokens, Special::Tokenize)
-        .unwrap_or_else(|_| "<decode error>".to_string());
+    let output_text = decode_tokens(&state.model, &output_tokens);
 
     let completion_tokens = output_tokens.len() as u32;
 
@@ -308,4 +328,24 @@ fn build_prompt(messages: &[ChatMessage]) -> String {
     }
     prompt.push_str("Assistant: ");
     prompt
+}
+
+fn decode_tokens(model: &LlamaModel, tokens: &[LlamaToken]) -> String {
+    let mut out = String::with_capacity(tokens.len() * 4);
+    for &token in tokens {
+        // Try with a reasonable initial buffer (32 bytes)
+        let bytes = match model.token_to_piece_bytes(token, 32, true, None) {
+            Ok(b) => b,
+            Err(TokenToStringError::InsufficientBufferSpace(neg)) => {
+                // Retry with the suggested buffer size
+                let size = (-neg).max(0).try_into().unwrap_or(256);
+                model.token_to_piece_bytes(token, size, true, None).unwrap_or_default()
+            }
+            _ => continue,
+        };
+        if let Ok(s) = String::from_utf8(bytes) {
+            out.push_str(&s);
+        }
+    }
+    out
 }
