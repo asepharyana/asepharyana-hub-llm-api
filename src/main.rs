@@ -1,7 +1,10 @@
 use axum::{
     extract::State,
     http::{HeaderMap, StatusCode},
-    response::Json,
+    response::{
+        sse::{Event, KeepAlive, Sse},
+        IntoResponse, Json,
+    },
     routing::{get, post},
     Router,
 };
@@ -15,9 +18,12 @@ use llama_cpp_2::{
     TokenToStringError,
 };
 use serde::{Deserialize, Serialize};
-use std::num::NonZeroU32;
-use std::sync::Arc;
+use std::{
+    num::NonZeroU32,
+    sync::Arc,
+};
 use tokio::sync::Mutex;
+use tokio_stream::wrappers::ReceiverStream;
 use tower_http::cors::CorsLayer;
 use tracing::info;
 
@@ -27,7 +33,6 @@ struct CtxInner {
     sampler: LlamaSampler,
 }
 
-// SAFETY: llama.cpp contexts are accessed from a single thread via the Mutex
 unsafe impl Send for CtxInner {}
 unsafe impl Sync for CtxInner {}
 
@@ -45,10 +50,8 @@ impl CtxInner {
         self.context.decode(&mut batch).map_err(|e| e.to_string())
     }
 
-    // Use raw pointer to avoid borrow checker limitations with llama-cpp-2 API
     fn sample_token(&mut self) -> LlamaToken {
         let ctx_ptr: *const llama_cpp_2::context::LlamaContext = &self.context;
-        // SAFETY: sampler is the sole owner of the context reference during this call
         let ctx_ref = unsafe { &*ctx_ptr };
         self.sampler.sample(ctx_ref, -1)
     }
@@ -133,13 +136,39 @@ struct HealthResponse {
     model: String,
 }
 
+// ── SSE Chunk Types ──
+
+#[derive(Serialize)]
+struct SseChunk {
+    id: String,
+    object: String,
+    created: i64,
+    model: String,
+    choices: Vec<SseChoice>,
+}
+
+#[derive(Serialize)]
+struct SseChoice {
+    index: u32,
+    delta: SseDelta,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    finish_reason: Option<String>,
+}
+
+#[derive(Serialize)]
+struct SseDelta {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    role: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    content: Option<String>,
+}
+
 const DEFAULT_MODEL_PATH: &str = "/models/MiniCPM-V-4.6-Q4_K_M.gguf";
-const EOS_TOKEN: i32 = 248044;
 
 fn check_auth(headers: &HeaderMap) -> Result<(), (StatusCode, String)> {
     let api_key = std::env::var("API_KEY").unwrap_or_default();
     if api_key.is_empty() {
-        return Ok(()); // no key configured = open
+        return Ok(());
     }
     let header = headers
         .get("authorization")
@@ -188,7 +217,6 @@ async fn main() {
         .new_context(&backend, ctx_params)
         .expect("Failed to create context");
 
-    // Extend lifetime: model outlives context
     let context: llama_cpp_2::context::LlamaContext<'static> =
         unsafe { std::mem::transmute(context) };
 
@@ -238,13 +266,13 @@ async fn chat_completions(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     Json(req): Json<ChatRequest>,
-) -> Result<Json<ChatResponse>, (StatusCode, String)> {
-    info!("Chat: {} chars, max_tokens={:?}", req.messages.len(), req.max_tokens);
+) -> Result<impl IntoResponse, (StatusCode, String)> {
     check_auth(&headers)?;
-    let prompt = build_prompt(&req.messages);
-    let max_tokens = req.max_tokens.unwrap_or(256).min(1024);
 
-    info!("Chat: {} chars, max_tokens={}", prompt.len(), max_tokens);
+    let chat_id = format!("chatcmpl-{}", uuid::Uuid::new_v4());
+    let created = chrono::Utc::now().timestamp();
+    let max_tokens = req.max_tokens.unwrap_or(256).min(1024);
+    let prompt = build_prompt(&req.messages);
 
     // Tokenize
     let input_tokens = state
@@ -253,99 +281,203 @@ async fn chat_completions(
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     let prompt_tokens = input_tokens.len() as u32;
-    info!("  {} prompt tokens", prompt_tokens);
+    info!("  Chat: {} prompt tokens, max_tokens={}", prompt_tokens, max_tokens);
 
-    // Lock context
-    let mut inner = state.ctx.lock().await;
+    if req.stream.unwrap_or(false) {
+        // ── Streaming mode: spawn generator, pipe via mpsc channel ──
+        let state = state.clone();
+        let model_name = req.model.clone();
+        let (tx, rx) = tokio::sync::mpsc::channel::<Result<Event, std::convert::Infallible>>(64);
 
-    inner.clear();
-    inner.prefill(&input_tokens).map_err(|e| {
-        (StatusCode::INTERNAL_SERVER_ERROR, format!("Prefill: {e}"))
-    })?;
+        tokio::spawn(async move {
+            // Send role chunk
+            let role_chunk = serde_json::to_string(&SseChunk {
+                id: chat_id.clone(),
+                object: "chat.completion.chunk".into(),
+                created,
+                model: model_name.clone(),
+                choices: vec![SseChoice {
+                    index: 0,
+                    delta: SseDelta {
+                        role: Some("assistant".into()),
+                        content: None,
+                    },
+                    finish_reason: None,
+                }],
+            }).unwrap();
+            let _ = tx.send(Ok(Event::default().data(role_chunk))).await;
 
-    // Generate
-    let mut output_tokens: Vec<LlamaToken> = Vec::new();
-
-    // First sample from prefill
-    let mut current = inner.sample_token();
-
-    for _ in 0..max_tokens {
-        if current.0 == EOS_TOKEN {
-            break;
-        }
-        let pos = input_tokens.len() as i32 + output_tokens.len() as i32;
-        output_tokens.push(current);
-
-        // Decode the last token
-        inner.decode_token(current, pos)
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Decode: {e}")))?;
-
-        // Sample next token
-        current = inner.sample_token();
-    }
-
-    let output_text = decode_tokens(&state.model, &output_tokens);
-
-    let completion_tokens = output_tokens.len() as u32;
-
-    info!("  {} generated tokens", completion_tokens);
-
-    Ok(Json(ChatResponse {
-        id: format!("chatcmpl-{}", uuid::Uuid::new_v4()),
-        object: "chat.completion".into(),
-        created: chrono::Utc::now().timestamp(),
-        model: req.model,
-        choices: vec![Choice {
-            index: 0,
-            message: ResponseMessage {
-                role: "assistant".into(),
-                content: output_text,
-            },
-            finish_reason: if completion_tokens < max_tokens {
-                "stop"
-            } else {
-                "length"
+            // Lock model context
+            let mut inner = state.ctx.lock().await;
+            inner.clear();
+            if let Err(e) = inner.prefill(&input_tokens) {
+                info!("  Prefill error: {e}");
+                return;
             }
-            .into(),
-        }],
-        usage: Usage {
-            prompt_tokens,
-            completion_tokens,
-            total_tokens: prompt_tokens + completion_tokens,
-        },
-    }))
+
+            let mut count = 0u32;
+            loop {
+                if count >= max_tokens {
+                    let chunk = serde_json::to_string(&SseChunk {
+                        id: chat_id.clone(),
+                        object: "chat.completion.chunk".into(),
+                        created,
+                        model: model_name.clone(),
+                        choices: vec![SseChoice {
+                            index: 0,
+                            delta: SseDelta { role: None, content: None },
+                            finish_reason: Some("length".into()),
+                        }],
+                    }).unwrap();
+                    let _ = tx.send(Ok(Event::default().data(chunk))).await;
+                    break;
+                }
+
+                let token = inner.sample_token();
+
+                if state.model.is_eog_token(token) {
+                    let chunk = serde_json::to_string(&SseChunk {
+                        id: chat_id.clone(),
+                        object: "chat.completion.chunk".into(),
+                        created,
+                        model: model_name.clone(),
+                        choices: vec![SseChoice {
+                            index: 0,
+                            delta: SseDelta { role: None, content: None },
+                            finish_reason: Some("stop".into()),
+                        }],
+                    }).unwrap();
+                    let _ = tx.send(Ok(Event::default().data(chunk))).await;
+                    break;
+                }
+
+                let piece = decode_token_piece(&state.model, token);
+                let content = clean_text(&piece);
+                if !content.is_empty() {
+                    let chunk = serde_json::to_string(&SseChunk {
+                        id: chat_id.clone(),
+                        object: "chat.completion.chunk".into(),
+                        created,
+                        model: model_name.clone(),
+                        choices: vec![SseChoice {
+                            index: 0,
+                            delta: SseDelta { role: None, content: Some(content) },
+                            finish_reason: None,
+                        }],
+                    }).unwrap();
+                    if tx.send(Ok(Event::default().data(chunk))).await.is_err() {
+                        break; // Client disconnected
+                    }
+                }
+
+                let pos = input_tokens.len() as i32 + count as i32;
+                if let Err(e) = inner.decode_token(token, pos) {
+                    info!("  Decode error: {e}");
+                    break;
+                }
+                count += 1;
+            }
+        });
+
+        let stream = ReceiverStream::new(rx);
+        let sse = Sse::new(stream).keep_alive(KeepAlive::default());
+        Ok(sse.into_response())
+    } else {
+        // ── Non-streaming mode ──
+        let mut inner = state.ctx.lock().await;
+        inner.clear();
+        inner.prefill(&input_tokens).map_err(|e| {
+            (StatusCode::INTERNAL_SERVER_ERROR, format!("Prefill: {e}"))
+        })?;
+
+        let mut output_tokens: Vec<LlamaToken> = Vec::new();
+        let mut current = inner.sample_token();
+
+        for _ in 0..max_tokens {
+            if state.model.is_eog_token(current) {
+                break;
+            }
+            let pos = input_tokens.len() as i32 + output_tokens.len() as i32;
+            output_tokens.push(current);
+            inner.decode_token(current, pos)
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Decode: {e}")))?;
+            current = inner.sample_token();
+        }
+
+        let output_text = decode_tokens(&state.model, &output_tokens);
+        let completion_tokens = output_tokens.len() as u32;
+
+        info!("  {} generated tokens", completion_tokens);
+
+        Ok(Json(ChatResponse {
+            id: chat_id,
+            object: "chat.completion".into(),
+            created,
+            model: req.model,
+            choices: vec![Choice {
+                index: 0,
+                message: ResponseMessage {
+                    role: "assistant".into(),
+                    content: output_text,
+                },
+                finish_reason: if completion_tokens < max_tokens { "stop" } else { "length" }.into(),
+            }],
+            usage: Usage {
+                prompt_tokens,
+                completion_tokens,
+                total_tokens: prompt_tokens + completion_tokens,
+            },
+        })
+        .into_response())
+    }
 }
+
+// ── Helper Functions ──
 
 fn build_prompt(messages: &[ChatMessage]) -> String {
     let mut prompt = String::new();
-    for msg in messages {
-        match msg.role.as_str() {
-            "system" => prompt.push_str(&format!("System: {}\n", msg.content)),
-            "user" => prompt.push_str(&format!("User: {}\n", msg.content)),
-            "assistant" => prompt.push_str(&format!("Assistant: {}\n", msg.content)),
-            _ => prompt.push_str(&format!("{}\n", msg.content)),
+    for (i, msg) in messages.iter().enumerate() {
+        let role = match msg.role.as_str() {
+            "system" => "system",
+            "user" => "user",
+            "assistant" => "assistant",
+            _ => "user",
+        };
+        if i == 0 && role == "system" {
+            prompt.push_str(&format!("<|im_start|>system\n{}<|im_end|>\n", msg.content));
+        } else {
+            prompt.push_str(&format!("<|im_start|>{}\n{}<|im_end|>\n", role, msg.content));
         }
     }
-    prompt.push_str("Assistant: ");
+    prompt.push_str("<|im_start|>assistant\n<think>\n\n</think>\n\n");
     prompt
+}
+
+fn decode_token_piece(model: &LlamaModel, token: LlamaToken) -> String {
+    let bytes = match model.token_to_piece_bytes(token, 32, true, None) {
+        Ok(b) => b,
+        Err(TokenToStringError::InsufficientBufferSpace(neg)) => {
+            let size = (-neg).max(0).try_into().unwrap_or(256);
+            model.token_to_piece_bytes(token, size, true, None).unwrap_or_default()
+        }
+        _ => return String::new(),
+    };
+    String::from_utf8(bytes).unwrap_or_default()
+}
+
+fn clean_text(text: &str) -> String {
+    text.replace("<|im_end|>", "")
+        .replace("<|im_start|>", "")
+        .replace("<think>", "")
+        .replace("</think>", "")
+        .trim()
+        .to_string()
 }
 
 fn decode_tokens(model: &LlamaModel, tokens: &[LlamaToken]) -> String {
     let mut out = String::with_capacity(tokens.len() * 4);
     for &token in tokens {
-        // Try with a reasonable initial buffer (32 bytes)
-        let bytes = match model.token_to_piece_bytes(token, 32, true, None) {
-            Ok(b) => b,
-            Err(TokenToStringError::InsufficientBufferSpace(neg)) => {
-                // Retry with the suggested buffer size
-                let size = (-neg).max(0).try_into().unwrap_or(256);
-                model.token_to_piece_bytes(token, size, true, None).unwrap_or_default()
-            }
-            _ => continue,
-        };
-        if let Ok(s) = String::from_utf8(bytes) {
-            out.push_str(&s);
-        }
+        out.push_str(&decode_token_piece(model, token));
     }
-    out
+    clean_text(&out)
 }
