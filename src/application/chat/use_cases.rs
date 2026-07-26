@@ -1,97 +1,72 @@
 //! Chat completion use cases.
 //!
 //! Orchestrates prompt building, sampler construction, and output parsing.
-//! These are pure functions with no framework dependencies.
 
+use llama_cpp_2::model::LlamaChatMessage;
 use llama_cpp_2::sampling::LlamaSampler;
 
-use crate::domain::entity::{ChatMessage, ChatRequest, ToolCall, ToolCallFunction, ToolDef};
+use crate::domain::entity::{ChatRequest, ToolCall, ToolCallFunction};
 
-/// Build a prompt string from conversation messages and optional tool definitions.
-///
-/// Uses ChatML format with `<|im_start|>` / `<|im_end|>` delimiters. Tool
-/// definitions are injected into the first system message.
-pub fn build_prompt(messages: &[ChatMessage], tools: &Option<Vec<ToolDef>>) -> String {
-    let mut prompt = String::new();
+/// Build a prompt string from conversation messages using the model's baked-in
+/// chat template. The template handles system/user/assistant/tool messages,
+/// thinking mode, and tool definitions automatically.
+pub fn build_prompt(
+    model: &llama_cpp_2::model::LlamaModel,
+    messages: &[crate::domain::entity::ChatMessage],
+    _tools: &Option<Vec<crate::domain::entity::ToolDef>>,
+) -> Result<String, String> {
+    let tmpl = model
+        .chat_template(None)
+        .map_err(|e| format!("Chat template error: {e}"))?;
 
-    for (i, msg) in messages.iter().enumerate() {
-        match msg.role.as_str() {
-            "system" => {
-                let mut content = msg.content.clone().unwrap_or_default();
-                // Inject tools into the system message (first occurrence)
-                if i == 0 {
-                    if let Some(tools_list) = tools {
-                        if !tools_list.is_empty() {
-                            let mut tools_text = String::from(
-                                "\n\n# Tools\n\nYou have access to the following functions:\n\n<tools>",
-                            );
-                            for tool in tools_list {
-                                tools_text.push('\n');
-                                tools_text.push_str(
-                                    &serde_json::to_string(tool).unwrap_or_default(),
-                                );
-                            }
-                            tools_text.push_str(
-                                "\n</tools>\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple lines\n</parameter>\n</function>\n</tool_call>",
-                            );
-                            content.push_str(&tools_text);
-                        }
-                    }
-                }
-                prompt.push_str(&format!("<|im_start|>system\n{}<|im_end|>\n", content));
-            }
-            "user" => {
-                let content = msg.content.as_deref().unwrap_or("");
-                if msg.tool_call_id.is_some() || msg.name.is_some() {
-                    prompt.push_str(&format!(
-                        "<|im_start|>user\n<tool_response>\n{}\n</tool_response><|im_end|>\n",
-                        content
-                    ));
-                } else {
-                    prompt.push_str(&format!("<|im_start|>user\n{}<|im_end|>\n", content));
-                }
-            }
-            "assistant" => {
-                let content = msg.content.as_deref().unwrap_or("");
-                if let Some(tcs) = &msg.tool_calls {
-                    let mut asst = format!("<|im_start|>assistant\n{}", content);
-                    for tc in tcs {
-                        let args: serde_json::Value =
-                            serde_json::from_str(&tc.function.arguments).unwrap_or_default();
-                        asst.push_str(&format!(
-                            "<tool_call>\n<function={}>\n",
-                            tc.function.name
-                        ));
-                        if let Some(obj) = args.as_object() {
-                            for (k, v) in obj {
-                                let val = match v {
-                                    serde_json::Value::String(s) => s.clone(),
-                                    other => serde_json::to_string(other).unwrap_or_default(),
-                                };
-                                asst.push_str(&format!("<parameter={}>\n{}\n</parameter>\n", k, val));
-                            }
-                        }
-                        asst.push_str("</function>\n</tool_call>");
-                    }
-                    asst.push_str("<|im_end|>\n");
-                    prompt.push_str(&asst);
-                } else {
-                    prompt.push_str(&format!(
-                        "<|im_start|>assistant\n{}<|im_end|>\n",
-                        content
+    let mut chat_msgs: Vec<LlamaChatMessage> = Vec::new();
+
+    for msg in messages {
+        let content = msg.content.clone().unwrap_or_default();
+        let role = msg.role.clone();
+
+        // Build content with tool calls for assistant messages
+        let full_content = if role == "assistant" {
+            if let Some(tcs) = &msg.tool_calls {
+                let mut c = content;
+                for tc in tcs {
+                    let args: serde_json::Value =
+                        serde_json::from_str(&tc.function.arguments).unwrap_or_default();
+                    let args_str = serde_json::to_string(&args).unwrap_or_default();
+                    c.push_str(&format!(
+                        "<tool_call>\n<function={}>\n{}\n</function>\n</tool_call>",
+                        tc.function.name, args_str
                     ));
                 }
+                c
+            } else {
+                content
             }
-            _ => {
-                let content = msg.content.as_deref().unwrap_or("");
-                prompt.push_str(&format!("<|im_start|>user\n{}<|im_end|>\n", content));
-            }
-        }
+        } else {
+            content
+        };
+
+        let llama_role = match role.as_str() {
+            "tool" => "tool".to_string(),
+            r => r.to_string(),
+        };
+
+        chat_msgs.push(
+            LlamaChatMessage::new(llama_role, full_content)
+                .map_err(|e| format!("Message error: {e}"))?,
+        );
     }
 
-    // Generation prompt
-    prompt.push_str("<|im_start|>assistant\n");
-    prompt
+    // Apply chat template with generation prompt (add_ass = true)
+    let mut result = model
+        .apply_chat_template(&tmpl, &chat_msgs, true)
+        .map_err(|e| format!("Template error: {e}"))?;
+
+    // Append think trigger for MiniCPM5 thinking mode:
+    // <|im_start|>assistant\n<think>\n  → model generates reasoning + </think> + answer
+    result.push_str("<think>\n");
+
+    Ok(result)
 }
 
 /// Parameters for building a [`LlamaSampler`] chain.
@@ -135,7 +110,6 @@ pub fn build_sampler(params: &SamplerParams) -> LlamaSampler {
     let seed = params.seed;
     let mut samplers: Vec<LlamaSampler> = Vec::new();
 
-    // Repetition/frequency/presence penalties
     let repeat = repeat_penalty.unwrap_or(1.0);
     let freq = frequency_penalty.unwrap_or(0.0);
     let present = presence_penalty.unwrap_or(0.0);
@@ -143,22 +117,18 @@ pub fn build_sampler(params: &SamplerParams) -> LlamaSampler {
         samplers.push(LS::penalties(64, repeat, freq, present));
     }
 
-    // top_k
     if let Some(k) = top_k {
         samplers.push(LS::top_k(k as i32));
     }
 
-    // top_p
     if let Some(p) = top_p {
         samplers.push(LS::top_p(p, 1));
     }
 
-    // min_p
     if let Some(p) = min_p {
         samplers.push(LS::min_p(p, 1));
     }
 
-    // Temperature + final selector
     let temp = temperature.unwrap_or(0.0);
     if temp <= 0.0 {
         samplers.push(LS::greedy());
@@ -173,7 +143,6 @@ pub fn build_sampler(params: &SamplerParams) -> LlamaSampler {
     LlamaSampler::chain_simple(samplers)
 }
 
-
 // ═══════════════════════════════════════════════════════════════
 //  TEXT PROCESSING
 // ═══════════════════════════════════════════════════════════════
@@ -182,15 +151,8 @@ pub fn build_sampler(params: &SamplerParams) -> LlamaSampler {
 pub fn clean_text(text: &str) -> String {
     text.replace("<|im_end|>", "")
         .replace("<|im_start|>", "")
-        .replace("<|thought_begin|>", "")
-        .replace("<|thought_end|>", "")
-        .replace("<|tool_call|>", "")
-        .replace("<|execute_start|>", "")
-        .replace("<|execute_end|>", "")
         .replace("<think>", "")
         .replace("</think>", "")
-        .replace("/think", "")
-        .replace("/no_think", "")
         .trim()
         .to_string()
 }
@@ -271,7 +233,6 @@ pub fn parse_tool_calls(text: &str) -> (String, Vec<ToolCall>) {
                 continue;
             }
         }
-        // Save last param
         if let Some(p) = current_param.take() {
             args_map.insert(p, serde_json::Value::String(current_value.trim().to_string()));
         }
@@ -290,11 +251,8 @@ pub fn parse_tool_calls(text: &str) -> (String, Vec<ToolCall>) {
         idx = end;
     }
 
-    // Remove tool_call blocks from the text
     clean = clean.replace("<tool_call>", "").replace("</tool_call>", "");
-    // XML-like tags are already fully parsed; remaining text is the content
     clean = clean.trim().to_string();
-    // Strip remaining XML tags that aren't part of clean
     let cleaned = clean_text(&clean);
 
     (cleaned, tool_calls)

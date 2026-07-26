@@ -26,7 +26,8 @@ pub async fn chat_completions(
 ) -> Result<Response, AppError> {
     let max_tokens = req.max_tokens.unwrap_or(256).min(1024);
     let stop = req.stop.clone().unwrap_or_default();
-    let prompt = chat::build_prompt(&req.messages, &req.tools);
+    let prompt = chat::build_prompt(&state.engine.model, &req.messages, &req.tools)
+        .map_err(|e| AppError::LlmError(e))?;
 
     // Tokenize
     let input_tokens = state
