@@ -186,6 +186,39 @@ async fn handle_streaming(
                 break;
             }
 
+            // Skip leading EOS tokens (like <|im_end|> at start of generation)
+            if state.engine.is_eog(current) && text_buf.is_empty() {
+                // safety bound: don't skip more than 10
+                if count >= max_tokens || count > 10 {
+                    let chunk = serde_json::to_string(&SseChunk {
+                        id: chat_id.clone(),
+                        object: "chat.completion.chunk".into(),
+                        created,
+                        model: model_name.clone(),
+                        choices: vec![SseChoice {
+                            index: 0,
+                            delta: SseDelta {
+                                role: None,
+                                content: None,
+                                tool_calls: None,
+                            },
+                            finish_reason: Some("stop".into()),
+                        }],
+                    })
+                    .unwrap();
+                    let _ = tx.send(Ok(Event::default().data(chunk))).await;
+                    break;
+                }
+                count += 1;
+                let pos = input_tokens.len() as i32 + count as i32;
+                if let Err(e) = inner.decode(current, pos) {
+                    info!("  Decode error: {e}");
+                    break;
+                }
+                current = inner.sample(&mut sampler);
+                continue;
+            }
+
             if state.engine.is_eog(current) {
                 let reason = if has_tools && text_buf.contains("<tool_call>") {
                     "tool_calls"

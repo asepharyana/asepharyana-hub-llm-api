@@ -219,6 +219,16 @@ impl LlamaEngine {
 
         let mut current = inner.sample(sampler);
 
+        // Skip leading EOS tokens (like <|im_end|> as first token)
+        while output.is_empty() && self.model.is_eog_token(current) {
+            let pos = input_tokens.len() as i32 + output.len() as i32;
+            if let Err(e) = inner.decode(current, pos) {
+                tracing::info!("  Decode error: {e}");
+                break;
+            }
+            current = inner.sample(sampler);
+        }
+
         for _ in 0..max_tokens {
             if self.model.is_eog_token(current) {
                 break;
