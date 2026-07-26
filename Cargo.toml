@@ -6,6 +6,7 @@ edition = "2021"
 [dependencies]
 # LLM inference
 llama-cpp-2 = "0.1"
+minijinja = "2"
 
 # HTTP server
 axum = { version = "0.8", features = ["json"] }

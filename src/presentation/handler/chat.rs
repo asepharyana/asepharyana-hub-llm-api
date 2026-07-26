@@ -72,7 +72,8 @@ async fn handle_non_streaming(
         .generate(&input_tokens, &mut sampler, max_tokens, &stop)
         .await?;
 
-    let (output_text, tool_calls) = chat::parse_tool_calls(&chat::clean_text(&raw_text));
+    let (reasoning, cleaned) = chat::clean_text(&raw_text);
+    let (output_text, tool_calls) = chat::parse_tool_calls(&cleaned);
 
     let completion_tokens = output_tokens.len() as u32;
     info!("  {} generated tokens", completion_tokens);
@@ -85,6 +86,8 @@ async fn handle_non_streaming(
         "length"
     };
 
+    let reasoning_opt = if reasoning.is_empty() { None } else { Some(reasoning) };
+
     Ok(Json(ChatResponse {
         id: chat_id,
         object: "chat.completion".into(),
@@ -95,6 +98,7 @@ async fn handle_non_streaming(
             message: ResponseMessage {
                 role: "assistant".into(),
                 content: Some(output_text),
+                reasoning_content: reasoning_opt,
                 tool_calls: if tool_calls.is_empty() {
                     None
                 } else {
@@ -141,6 +145,7 @@ async fn handle_streaming(
                     role: Some("assistant".into()),
                     content: None,
                     tool_calls: None,
+                    reasoning_content: None,
                 },
                 finish_reason: None,
             }],
@@ -178,6 +183,7 @@ async fn handle_streaming(
                             role: None,
                             content: None,
                             tool_calls: None,
+                            reasoning_content: None,
                         },
                         finish_reason: Some("length".into()),
                     }],
@@ -202,6 +208,7 @@ async fn handle_streaming(
                                 role: None,
                                 content: None,
                                 tool_calls: None,
+                                reasoning_content: None,
                             },
                             finish_reason: Some("stop".into()),
                         }],
@@ -237,6 +244,7 @@ async fn handle_streaming(
                             role: None,
                             content: None,
                             tool_calls: None,
+                            reasoning_content: None,
                         },
                         finish_reason: Some(reason.into()),
                     }],
@@ -247,7 +255,7 @@ async fn handle_streaming(
             }
 
             let piece = state.engine.decode_token(current);
-            let content = chat::clean_text(&piece);
+            let (_reasoning, content) = chat::clean_text(&piece);
 
             if !content.is_empty() {
                 let chunk = serde_json::to_string(&SseChunk {
@@ -261,6 +269,7 @@ async fn handle_streaming(
                             role: None,
                             content: Some(content.clone()),
                             tool_calls: None,
+                            reasoning_content: None,
                         },
                         finish_reason: None,
                     }],
@@ -293,6 +302,7 @@ async fn handle_streaming(
                             role: None,
                             content: None,
                             tool_calls: None,
+                            reasoning_content: None,
                         },
                         finish_reason: Some("stop".into()),
                     }],
@@ -318,6 +328,7 @@ async fn handle_streaming(
                                 role: None,
                                 content: None,
                                 tool_calls: None,
+                                reasoning_content: None,
                             },
                             finish_reason: Some("tool_calls".into()),
                         }],

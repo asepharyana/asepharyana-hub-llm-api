@@ -1,0 +1,53 @@
+{{- bos_token }}
+{%- if tools %}
+    {%- set tool_definitions %}
+        {{- "# Tools\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>" }}
+        {%- for tool in tools %}
+            {{- "\n" }}
+            {{- tool | tojson }}
+        {%- endfor %}
+        {{- '\n</tools>\n\nTool usage guidelines:\n- You may call zero or more functions. If no function calls are needed, just answer normally.\n- When calling a function, use: <function name="name"><param name="key">value</param></function>' }}
+    {%- endset %}
+
+    {{- '<|im_start|>system\n' }}
+    {%- if messages[0].role == 'system' %}
+        {{- messages[0].content + '\n\n' + tool_definitions }}
+    {%- else %}
+        {{- tool_definitions }}
+    {%- endif %}
+    {{- '<|im_end|>\n' }}
+{%- else %}
+    {%- if messages[0].role == 'system' %}
+        {{- '<|im_start|>system\n' + messages[0].content + '<|im_end|>\n' }}
+    {%- endif %}
+{%- endif %}
+{%- for message in messages %}
+    {%- set content = message.content %}
+    {%- if (message.role == "user") or (message.role == "system" and not loop.first) %}
+        {{- '<|im_start|>' + message.role + '\n' + content + '<|im_end|>' + '\n' }}
+    {%- elif message.role == "assistant" %}
+        {%- if message.tool_calls %}
+            {%- set content = message.content %}
+            {%- for tool_call in message.tool_calls %}
+                {%- if tool_call.type == "function" %}
+                    {%- set content = content + "\n<tool_call>\n<function=" + tool_call.function.name + ">\n" + (tool_call.function.arguments | tojson) + "\n</function>\n</tool_call>" %}
+                {%- endif %}
+            {%- endfor %}
+            {{- '<|im_start|>assistant\n' + content + '<|im_end|>\n' }}
+        {%- else %}
+            {{- '<|im_start|>assistant\n' + content + '<|im_end|>\n' }}
+        {%- endif %}
+    {%- elif message.role == "tool" %}
+        {{- '<|im_start|>user\n<tool_response>\n' + content + '\n</tool_response><|im_end|>\n' }}
+    {%- endif %}
+{%- endfor %}
+{%- if add_generation_prompt %}
+    {{- '<|im_start|>assistant\n' }}
+    {%- if enable_thinking is defined %}
+        {%- if enable_thinking is false %}
+            {{- '<think>\n\n</think>\n\n' }}
+        {%- elif enable_thinking is true %}
+            {{- '<think>\n' }}
+        {%- endif %}
+    {%- endif %}
+{%- endif %}

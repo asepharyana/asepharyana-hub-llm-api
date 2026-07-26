@@ -1,70 +1,93 @@
 //! Chat completion use cases.
 //!
-//! Orchestrates prompt building, sampler construction, and output parsing.
+//! Orchestrates prompt building using the model's baked-in Jinja template
+//! via the `minijinja` crate, sampler construction, and output parsing.
 
-use llama_cpp_2::model::LlamaChatMessage;
+use std::collections::HashMap;
+
+use minijinja::{Environment, Value};
 use llama_cpp_2::sampling::LlamaSampler;
 
-use crate::domain::entity::{ChatRequest, ToolCall, ToolCallFunction};
+use crate::domain::entity::{ChatMessage, ChatRequest, ToolCall, ToolCallFunction};
 
-/// Build a prompt string from conversation messages using the model's baked-in
-/// chat template. The template handles system/user/assistant/tool messages,
-/// thinking mode, and tool definitions automatically.
+/// Build a prompt from messages using the GGUF's Jinja chat template.
+///
+/// Renders the model's baked-in template via minijinja, passing the message
+/// history, optional tool definitions, and generation-prompt switches.
 pub fn build_prompt(
     model: &llama_cpp_2::model::LlamaModel,
-    messages: &[crate::domain::entity::ChatMessage],
+    messages: &[ChatMessage],
     _tools: &Option<Vec<crate::domain::entity::ToolDef>>,
 ) -> Result<String, String> {
-    let tmpl = model
-        .chat_template(None)
-        .map_err(|e| format!("Chat template error: {e}"))?;
+    // Load the GGUF's chat template (embedded at crate build time)
+    let template_str = include_str!("templates/chat_template.jinja");
 
-    let mut chat_msgs: Vec<LlamaChatMessage> = Vec::new();
+    let mut env = Environment::new();
+    env.add_template("chat", template_str)
+        .map_err(|e| format!("Template add error: {e}"))?;
 
+    // Register tojson filter (safe: Rust serde_json defaults to ensure_ascii=false)
+    env.add_filter("tojson", |value: &Value| -> String {
+        serde_json::to_string(value).unwrap_or_default()
+    });
+
+    let tmpl = env.get_template("chat")
+        .map_err(|e| format!("Template get error: {e}"))?;
+
+    // Build messages as serde_json::Value for minijinja
+    let mut msgs_val: Vec<Value> = Vec::new();
     for msg in messages {
-        let content = msg.content.clone().unwrap_or_default();
-        let role = msg.role.clone();
+        let mut m: HashMap<String, Value> = HashMap::new();
+        m.insert("role".into(), Value::from(msg.role.clone()));
 
-        // Build content with tool calls for assistant messages
-        let full_content = if role == "assistant" {
+        let content = msg.content.clone().unwrap_or_default();
+
+        // For assistant messages, check if there are tool_calls
+        if msg.role == "assistant" {
             if let Some(tcs) = &msg.tool_calls {
-                let mut c = content;
-                for tc in tcs {
+                // Serialise tool calls per the template's expected format
+                let tcs_val: Vec<Value> = tcs.iter().map(|tc| {
                     let args: serde_json::Value =
                         serde_json::from_str(&tc.function.arguments).unwrap_or_default();
-                    let args_str = serde_json::to_string(&args).unwrap_or_default();
-                    c.push_str(&format!(
-                        "<tool_call>\n<function={}>\n{}\n</function>\n</tool_call>",
-                        tc.function.name, args_str
-                    ));
-                }
-                c
-            } else {
-                content
+                    Value::from_serialize(&serde_json::json!({
+                        "id": tc.id,
+                        "type": "function",
+                        "function": {
+                            "name": tc.function.name,
+                            "arguments": args,
+                        }
+                    }))
+                }).collect();
+                m.insert("tool_calls".into(), Value::from(tcs_val));
             }
+        }
+
+        // Handle tool role messages
+        if msg.role == "tool" {
+            // Wrap in tool_response as the template expects
+            let wrapped = format!("<tool_response>\n{}\n</tool_response>", content);
+            m.insert("content".into(), Value::from(wrapped));
         } else {
-            content
-        };
+            m.insert("content".into(), Value::from(content));
+        }
 
-        let llama_role = match role.as_str() {
-            "tool" => "tool".to_string(),
-            r => r.to_string(),
-        };
-
-        chat_msgs.push(
-            LlamaChatMessage::new(llama_role, full_content)
-                .map_err(|e| format!("Message error: {e}"))?,
-        );
+        msgs_val.push(Value::from(m));
     }
 
-    // Apply chat template with generation prompt (add_ass = true)
-    let mut result = model
-        .apply_chat_template(&tmpl, &chat_msgs, true)
-        .map_err(|e| format!("Template error: {e}"))?;
+    // BOS token for sentencepiece / unigram models
+    let bos_token: &str = "<s>";
 
-    // Append think trigger for MiniCPM5 thinking mode:
-    // <|im_start|>assistant\n<think>\n  → model generates reasoning + </think> + answer
-    result.push_str("<think>\n");
+    // Build context
+    let mut ctx: HashMap<String, Value> = HashMap::new();
+    ctx.insert("bos_token".into(), Value::from(bos_token));
+    ctx.insert("messages".into(), Value::from(msgs_val));
+    ctx.insert("add_generation_prompt".into(), Value::from(true));
+    ctx.insert("enable_thinking".into(), Value::from(true));
+
+    // Render
+    let result = tmpl
+        .render(&ctx)
+        .map_err(|e| format!("Template render error: {e}"))?;
 
     Ok(result)
 }
@@ -147,14 +170,32 @@ pub fn build_sampler(params: &SamplerParams) -> LlamaSampler {
 //  TEXT PROCESSING
 // ═══════════════════════════════════════════════════════════════
 
-/// Remove special tokens from generated text.
-pub fn clean_text(text: &str) -> String {
-    text.replace("<|im_end|>", "")
-        .replace("<|im_start|>", "")
-        .replace("<think>", "")
-        .replace("</think>", "")
-        .trim()
-        .to_string()
+/// Remove special tokens from generated text and separate reasoning.
+///
+/// For thinking models, returns (reasoning, cleaned_answer).
+pub fn clean_text(text: &str) -> (String, String) {
+    let text = text.replace("<|im_end|>", "")
+        .replace("<|im_start|>", "");
+
+    // Separate reasoning (between <think>/</think>) from answer
+    let text = text.trim();
+    let (reasoning, answer) = if let Some(close_idx) = text.find("</think>") {
+        let reasoning = text[..close_idx].trim()
+            .trim_start_matches("<think>")
+            .trim()
+            .to_string();
+        let answer = text[close_idx + 8..].trim().to_string();
+        (reasoning, answer)
+    } else if text.contains("<think>") {
+        // Still thinking — everything is reasoning
+        let reasoning = text.trim_start_matches("<think>").trim().to_string();
+        (reasoning, String::new())
+    } else {
+        (String::new(), text.to_string())
+    };
+
+    let answer = answer.replace("<think>", "").replace("</think>", "");
+    (reasoning, answer.trim().to_string())
 }
 
 /// Parse tool calls from generated text in the format:
@@ -253,7 +294,7 @@ pub fn parse_tool_calls(text: &str) -> (String, Vec<ToolCall>) {
 
     clean = clean.replace("<tool_call>", "").replace("</tool_call>", "");
     clean = clean.trim().to_string();
-    let cleaned = clean_text(&clean);
+    let (_reasoning, cleaned) = clean_text(&clean);
 
     (cleaned, tool_calls)
 }
