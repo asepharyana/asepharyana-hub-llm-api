@@ -168,6 +168,8 @@ async fn handle_streaming(
 
         let mut count = 0u32;
         let mut text_buf = String::new();
+        let mut sent_len: usize = 0;     // how many chars of text_buf have been sent
+        let mut think_done: bool = false; // true once </think> seen
         let mut current = inner.sample(&mut sampler);
 
         loop {
@@ -255,9 +257,97 @@ async fn handle_streaming(
             }
 
             let piece = state.engine.decode_token(current);
-            let (_reasoning, content) = chat::clean_text(&piece);
 
-            if !content.is_empty() {
+            // Push into buffer
+            text_buf.push_str(&piece);
+
+            // Detect </think> transition
+            if !think_done && text_buf.contains("</think>") {
+                think_done = true;
+            }
+
+            // Find new text since last send
+            let new_text = &text_buf[sent_len..]; // everything not yet streamed
+            if new_text.is_empty() {
+                // Nothing new to send; skip straight to decode
+                let pos = input_tokens.len() as i32 + count as i32;
+                if let Err(e) = inner.decode(current, pos) {
+                    info!("  Decode error: {e}");
+                    break;
+                }
+                count += 1;
+                current = inner.sample(&mut sampler);
+                continue;
+            }
+
+            // Strip special tokens from the NEW text chunk
+            // Split at </think> if present — before goes to reasoning, after to content
+            let (reasoning_part, content_part) = if let Some(pos) = new_text.find("</think>") {
+                let before = new_text[..pos]
+                    .replace("<|im_end|>", "")
+                    .replace("<|im_start|>", "")
+                    .replace("<think>", "")
+                    .trim()
+                    .to_string();
+                let after = new_text[pos + 8..]
+                    .replace("<|im_end|>", "")
+                    .replace("<|im_start|>", "")
+                    .replace("<think>", "")
+                    .trim()
+                    .to_string();
+                think_done = true;
+                (Some(before), after)
+            } else if think_done {
+                let cleaned = new_text
+                    .replace("<|im_end|>", "")
+                    .replace("<|im_start|>", "")
+                    .replace("<think>", "")
+                    .trim()
+                    .to_string();
+                (None, cleaned)
+            } else {
+                let cleaned = new_text
+                    .replace("<|im_end|>", "")
+                    .replace("<|im_start|>", "")
+                    .replace("<think>", "")
+                    .trim()
+                    .to_string();
+                (Some(cleaned), String::new())
+            };
+
+            // Send reasoning part (before </think>, or entire text if still thinking)
+            if let Some(ref r) = reasoning_part {
+                if !r.is_empty() {
+                    let delta = SseDelta {
+                        role: None,
+                        content: None,
+                        reasoning_content: Some(r.clone()),
+                        tool_calls: None,
+                    };
+                    let chunk = serde_json::to_string(&SseChunk {
+                        id: chat_id.clone(),
+                        object: "chat.completion.chunk".into(),
+                        created,
+                        model: model_name.clone(),
+                        choices: vec![SseChoice {
+                            index: 0,
+                            delta,
+                            finish_reason: None,
+                        }],
+                    })
+                    .unwrap();
+                    let _ = tx.send(Ok(Event::default().data(chunk))).await;
+                }
+            }
+
+            // Send content part (after </think>, or never if model doesn't think)
+            if !content_part.is_empty() {
+                let delta = SseDelta {
+                    role: None,
+                    content: Some(content_part),
+                    reasoning_content: None,
+                    tool_calls: None,
+                };
                 let chunk = serde_json::to_string(&SseChunk {
                     id: chat_id.clone(),
                     object: "chat.completion.chunk".into(),
@@ -265,12 +355,7 @@ async fn handle_streaming(
                     model: model_name.clone(),
                     choices: vec![SseChoice {
                         index: 0,
-                        delta: SseDelta {
-                            role: None,
-                            content: Some(content.clone()),
-                            tool_calls: None,
-                            reasoning_content: None,
-                        },
+                        delta,
                         finish_reason: None,
                     }],
                 })
@@ -280,7 +365,7 @@ async fn handle_streaming(
                 }
             }
 
-            text_buf.push_str(&piece);
+            sent_len = text_buf.len();
 
             // Check stop sequences
             let mut stop_now = false;
