@@ -89,8 +89,8 @@ pub fn build_prompt(messages: &[ChatMessage], tools: &Option<Vec<ToolDef>>) -> S
         }
     }
 
-    // Generation prompt: non-thinking mode
-    prompt.push_str("<|im_start|>assistant\n<think>\n\n</think>\n\n");
+    // Generation prompt: thinking mode (MiniCPM5 native)
+    prompt.push_str("<|im_start|>assistant\n/think\n\n");
     prompt
 }
 
@@ -182,8 +182,13 @@ pub fn build_sampler(params: &SamplerParams) -> LlamaSampler {
 pub fn clean_text(text: &str) -> String {
     text.replace("<|im_end|>", "")
         .replace("<|im_start|>", "")
-        .replace("<think>", "")
-        .replace("</think>", "")
+        .replace("<|thought_begin|>", "")
+        .replace("<|thought_end|>", "")
+        .replace("<|tool_call|>", "")
+        .replace("<|execute_start|>", "")
+        .replace("<|execute_end|>", "")
+        .replace("/think", "")
+        .replace("/no_think", "")
         .trim()
         .to_string()
 }

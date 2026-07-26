@@ -4,8 +4,8 @@
 
 use std::sync::LazyLock;
 
-const DEFAULT_MODEL_PATH: &str = "/models/MiniCPM-V-4.6-Q4_K_M.gguf";
-pub const MODEL_ID: &str = "minicpm-v-4.6";
+const DEFAULT_MODEL_PATH: &str = "/models/MiniCPM5-1B-Claude-Opus-Fable5-V2-Thinking-Q8_0.gguf";
+pub const MODEL_ID: &str = "minicpm5-1b-fable5-v2-thinking";
 
 /// Application configuration loaded at startup from environment variables.
 #[derive(Debug, Clone)]
@@ -44,7 +44,7 @@ impl AppConfig {
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(8080),
             log_level: std::env::var("RUST_LOG").unwrap_or_else(|_| "info".to_string()),
-            n_ctx: 2048,
+            n_ctx: 8192,
             n_batch: 512,
             n_threads: 4,
         }
