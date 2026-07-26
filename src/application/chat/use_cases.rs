@@ -89,8 +89,8 @@ pub fn build_prompt(messages: &[ChatMessage], tools: &Option<Vec<ToolDef>>) -> S
         }
     }
 
-    // Generation prompt
-    prompt.push_str("<|im_start|>assistant\n");
+    // Generation prompt: thinking mode (MiniCPM5 native)
+    prompt.push_str("<|im_start|>assistant\n/think\n\n");
     prompt
 }
 
