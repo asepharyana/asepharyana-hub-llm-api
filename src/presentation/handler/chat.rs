@@ -5,6 +5,7 @@ use std::sync::Arc;
 
 use axum::extract::State;
 use axum::response::sse::{Event, KeepAlive, Sse};
+use axum::http::HeaderMap;
 use axum::{Json, response::{IntoResponse, Response}};
 use chrono::Utc;
 use tokio::sync::mpsc;
@@ -435,6 +436,10 @@ async fn handle_streaming(
     });
 
     let stream = ReceiverStream::new(rx);
+    let mut headers = HeaderMap::new();
+    headers.insert("X-Accel-Buffering", "no".parse().unwrap());
+    headers.insert("Cache-Control", "no-cache".parse().unwrap());
+    headers.insert("Connection", "keep-alive".parse().unwrap());
     let sse = Sse::new(stream).keep_alive(KeepAlive::default());
-    Ok(sse.into_response())
+    Ok((headers, sse).into_response())
 }
