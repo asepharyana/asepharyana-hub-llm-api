@@ -57,6 +57,6 @@ docker compose -f docker-compose.yml up -d
 
 ## Infrastructure
 
-- Traefik router: `ai.asepharyana.my.id` → `llm-api:8080`
+- Traefik router: `ai.asepharyana.my.id` → `127.0.0.1:4010`
 - Network: `app-shared-net`
 - Docker Compose: see `llm-api.yml`

@@ -42,7 +42,7 @@ impl AppConfig {
             server_port: std::env::var("SERVER_PORT")
                 .ok()
                 .and_then(|v| v.parse().ok())
-                .unwrap_or(8080),
+                .unwrap_or(4010),
             log_level: std::env::var("RUST_LOG").unwrap_or_else(|_| "info".to_string()),
             n_ctx: 8192,
             n_batch: 512,
