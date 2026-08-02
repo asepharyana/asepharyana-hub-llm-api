@@ -42,11 +42,14 @@ MODEL_PATH=/path/to/model.gguf ./target/release/llm-api
 ./target/release/llm-api
 ```
 
-## Docker
+## Deploy (Nix + systemd)
 
 ```bash
-docker compose -f docker-compose.yml up -d
+nix build .#default --impure --option sandbox false
+# GitHub Actions: nix copy ssh://vps → systemctl restart llm-api
 ```
+
+> **Legacy (2026-08-02):** Docker compose dihapus dari produksi. Deploy sekarang Nix+systemd.
 
 ## Benchmark
 
@@ -57,6 +60,5 @@ docker compose -f docker-compose.yml up -d
 
 ## Infrastructure
 
-- Traefik router: `ai.asepharyana.my.id` → `127.0.0.1:4010`
-- Network: `app-shared-net`
-- Docker Compose: see `llm-api.yml`
+- Caddy reverse proxy: `ai.asepharyana.my.id` → `127.0.0.1:4010`
+- systemd unit `llm-api`, deploy Nix via GitHub Actions
