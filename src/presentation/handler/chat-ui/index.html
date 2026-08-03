@@ -72,6 +72,13 @@
     display: flex; align-items: center; gap: 6px;
   }
   .msg .tool-call::before { content: '\1F527'; }
+  .msg .reasoning {
+    font-size: 12px; font-style: italic;
+    color: var(--text2);
+    white-space: pre-wrap; word-break: break-word;
+    border-bottom: 1px solid var(--border);
+    padding-bottom: 8px; margin-bottom: 8px;
+  }
   .msg.error {
     background: #2a1818; border-color: #4a2828; color: #f08080;
   }
@@ -186,7 +193,32 @@ async function send() {
     const decoder = new TextDecoder();
     let buffer = '';
     let full = '';
+    let reasoning = '';
     let toolCalls = null;
+
+    // Re-render the assistant bubble: reasoning (muted) above the answer.
+    function render() {
+      el.innerHTML = '';
+      if (reasoning) {
+        const r = document.createElement('div');
+        r.className = 'reasoning';
+        r.textContent = reasoning;
+        el.appendChild(r);
+      }
+      if (full) {
+        const c = document.createElement('div');
+        c.textContent = full;
+        el.appendChild(c);
+      }
+      if (toolCalls?.length) {
+        for (const tc of toolCalls) {
+          const t = document.createElement('div');
+          t.className = 'tool-call';
+          t.textContent = 'Calling tool: ' + (tc.function?.name || 'tool');
+          el.appendChild(t);
+        }
+      }
+    }
 
     while (true) {
       const { done, value } = await reader.read();
@@ -206,18 +238,20 @@ async function send() {
           const delta = chunk.choices?.[0]?.delta;
           const finish = chunk.choices?.[0]?.finish_reason;
 
+          if (delta?.reasoning_content) {
+            reasoning += delta.reasoning_content;
+            render();
+          }
           if (delta?.content) {
             full += delta.content;
-            el.textContent = full;
+            render();
           }
           if (delta?.tool_calls) {
             toolCalls = delta.tool_calls;
+            render();
           }
-          if (finish === 'tool_calls' && toolCalls) {
-            const t = document.createElement('div');
-            t.className = 'tool-call';
-            t.textContent = 'Calling tool: ' + toolCalls.map(tc => tc.function?.name).join(', ');
-            el.appendChild(t);
+          if (finish === 'tool_calls') {
+            render();
           }
         } catch (e) { /* skip malformed chunk */ }
       }

@@ -335,7 +335,7 @@ pub fn parse_tool_calls(text: &str) -> (String, Vec<ToolCall>) {
 /// Handles both fixed tags (`<|im_end|>`, `<think>`, `<tool_call>`, …) and the
 /// attribute-bearing openers used by this model's tool format (`<function=…>`,
 /// `<parameter=…>`), even when a tag straddles a token boundary.
-fn strip_markup(text: &str) -> String {
+pub fn strip_markup(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut rest = text;
 
@@ -383,22 +383,42 @@ fn strip_markup(text: &str) -> String {
     out
 }
 
-/// Split an incremental streamed text fragment into `(reasoning, content)`
-/// deltas for SSE.
+/// Compute `(reasoning, content)` deltas for an incremental streamed fragment.
 ///
-/// * `think_done` means the `</think>` boundary was already crossed **before**
-///   this fragment (i.e. it is not the chunk containing the first `</think>`).
-/// * Whitespace **inside** a fragment is preserved — only the whitespace
-///   sitting immediately around the `</think>` boundary is trimmed, so
-///   reasoning does not end with a dangling newline and content does not begin
-///   with one. (Trimming every fragment corrupted inter-word spaces.)
-/// * Before the first `</think>`, everything is emitted as `reasoning_content`;
-///   after it, as `content`. A stray second `</think>` is stripped, not split.
-pub fn split_stream_chunk(new_text: &str, think_done: bool) -> (Option<String>, String) {
-    if !think_done {
-        if let Some(pos) = new_text.find("</think>") {
-            let mut before = strip_markup(&new_text[..pos]);
-            let mut after = strip_markup(&new_text[pos + 8..]);
+/// * `new_text` — the not-yet-emitted fragment (`text_buf[sent_len..]`).
+/// * `sent_len` — byte offset in the full buffer where `new_text` begins.
+/// * `content_start` — byte offset in the full buffer where the content phase
+///   begins (immediately after the first `</think>`); `None` while still
+///   thinking.
+///
+/// The boundary is a position in the *full* buffer, not a string search in the
+/// fragment — this stays correct even when `</think>` is split across tokens.
+/// Whitespace inside a fragment is preserved; only the edges around the
+/// boundary are trimmed. A stray second `</think>` is stripped, not re-split.
+pub fn split_stream_chunk(
+    new_text: &str,
+    sent_len: usize,
+    content_start: Option<usize>,
+) -> (Option<String>, String) {
+    match content_start {
+        // Still thinking — everything is reasoning.
+        None => {
+            let cleaned = strip_markup(new_text);
+            let reasoning = if cleaned.is_empty() {
+                None
+            } else {
+                Some(cleaned)
+            };
+            (reasoning, String::new())
+        }
+        // Boundary already emitted — everything is content.
+        Some(cs) if cs <= sent_len => (None, strip_markup(new_text)),
+        // Boundary falls inside this fragment (or beyond it, defensively).
+        Some(cs) => {
+            let rel = (cs - sent_len).min(new_text.len());
+            let (before, after) = new_text.split_at(rel);
+            let mut before = strip_markup(before);
+            let mut after = strip_markup(after);
 
             while before.ends_with(['\n', ' ', '\t']) {
                 before.pop();
@@ -413,19 +433,7 @@ pub fn split_stream_chunk(new_text: &str, think_done: bool) -> (Option<String>, 
                 Some(before)
             };
             (reasoning, after)
-        } else {
-            // Still thinking — everything is reasoning.
-            let cleaned = strip_markup(new_text);
-            let reasoning = if cleaned.is_empty() {
-                None
-            } else {
-                Some(cleaned)
-            };
-            (reasoning, String::new())
         }
-    } else {
-        // Think phase already ended — everything is content; strip stray markup.
-        (None, strip_markup(new_text))
     }
 }
 
@@ -471,7 +479,7 @@ mod tests {
 
     #[test]
     fn split_chunk_before_think_is_reasoning() {
-        let (reasoning, content) = split_stream_chunk("Hello ", false);
+        let (reasoning, content) = split_stream_chunk("Hello ", 0, None);
         assert_eq!(reasoning.as_deref(), Some("Hello "));
         assert_eq!(content, "");
     }
@@ -479,21 +487,23 @@ mod tests {
     #[test]
     fn split_chunk_preserves_internal_spaces() {
         // Regression: trimming every fragment used to eat inter-word spaces.
-        let (r1, _) = split_stream_chunk("Hello", false);
-        let (r2, _) = split_stream_chunk(" world", false);
+        let (r1, _) = split_stream_chunk("Hello", 0, None);
+        let (r2, _) = split_stream_chunk(" world", 5, None);
         assert_eq!(format!("{}{}", r1.unwrap(), r2.unwrap()), "Hello world");
     }
 
     #[test]
     fn split_chunk_boundary_trims_only_edges() {
-        let (reasoning, content) = split_stream_chunk("question\n</think>\n\nAnswer ", false);
+        // text_buf = "question\n</think>\n\nAnswer "; boundary right after the
+        // tag at byte 17.
+        let (reasoning, content) = split_stream_chunk("question\n</think>\n\nAnswer ", 0, Some(17));
         assert_eq!(reasoning.as_deref(), Some("question"));
         assert_eq!(content, "Answer ");
     }
 
     #[test]
     fn split_chunk_after_think_is_content() {
-        let (reasoning, content) = split_stream_chunk(" answer", true);
+        let (reasoning, content) = split_stream_chunk(" answer", 0, Some(0));
         assert_eq!(reasoning, None);
         assert_eq!(content, " answer");
     }
@@ -502,16 +512,29 @@ mod tests {
     fn split_chunk_stray_think_tag_is_stripped_not_split() {
         // A second </think> (already past the boundary) must not restart
         // reasoning classification.
-        let (reasoning, content) = split_stream_chunk("...</think>more", true);
+        let (reasoning, content) = split_stream_chunk("...</think>more", 0, Some(0));
         assert_eq!(reasoning, None);
         assert_eq!(content, "...more");
     }
 
     #[test]
+    fn split_chunk_boundary_straddling_tokens() {
+        // `</think>` split as "</think" + ">" across two fragments: the boundary
+        // is detected on the full buffer, so the answer still becomes content.
+        let (r1, _) = split_stream_chunk("reasoning...</think", 0, None);
+        assert!(r1.is_some());
+        let (r2, c2) = split_stream_chunk("\n\n2 + 2 = 4.", 18, Some(18));
+        assert_eq!(r2, None);
+        assert_eq!(c2, "\n\n2 + 2 = 4.");
+    }
+
+    #[test]
     fn split_chunk_strips_special_and_markup() {
+        // boundary at byte 30 (right after "</think>").
         let (reasoning, content) = split_stream_chunk(
             "<|im_end|><think>Hello</think>\n<tool_call><function=get_weather>",
-            false,
+            0,
+            Some(30),
         );
         assert_eq!(reasoning.as_deref(), Some("Hello"));
         assert_eq!(content, "");

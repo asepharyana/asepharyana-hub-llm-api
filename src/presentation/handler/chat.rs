@@ -176,7 +176,9 @@ async fn handle_streaming(
         let mut sampler = SendSampler(chat::build_sampler(&params));
         let mut text_buf = String::new();
         let mut sent_len: usize = 0;
-        let mut think_done = false;
+        // Byte offset in text_buf where the content phase begins (right after
+        // the first `</think>`); None while still thinking.
+        let mut content_start: Option<usize> = None;
 
         let outcome = engine.generate(
             &input_tokens,
@@ -187,11 +189,13 @@ async fn handle_streaming(
             &mut |_token, piece| {
                 text_buf.push_str(piece);
 
-                // `was_thinking` is passed to split_stream_chunk so the chunk
-                // containing the first </think> is treated as the boundary.
-                let was_thinking = !think_done;
-                if !think_done && text_buf.contains("</think>") {
-                    think_done = true;
+                // Robust boundary detection on the *full* buffer — a `</think>`
+                // tag may be split across tokens, which would defeat a search
+                // over the incremental fragment only.
+                if content_start.is_none() {
+                    if let Some(pos) = text_buf.find("</think>") {
+                        content_start = Some(pos + 8);
+                    }
                 }
 
                 let new_text = &text_buf[sent_len..];
@@ -199,7 +203,8 @@ async fn handle_streaming(
                     return true;
                 }
 
-                let (reasoning, content) = chat::split_stream_chunk(new_text, was_thinking);
+                let (reasoning, content) =
+                    chat::split_stream_chunk(new_text, sent_len, content_start);
 
                 if let Some(reasoning) = reasoning {
                     let chunk = SseChunk::delta(
@@ -250,6 +255,28 @@ async fn handle_streaming(
                     completion_tokens,
                     total_tokens: prompt_tokens + completion_tokens,
                 };
+
+                // If the model never emitted `</think>`, everything was streamed
+                // as reasoning_content. Flush it as content so the client always
+                // receives the response text.
+                if content_start.is_none() && !text_buf.is_empty() {
+                    let cleaned = chat::strip_markup(&text_buf);
+                    if !cleaned.is_empty() {
+                        let chunk = SseChunk::delta(
+                            chat_id.clone(),
+                            created,
+                            model_name.clone(),
+                            SseDelta {
+                                role: None,
+                                content: Some(cleaned),
+                                tool_calls: None,
+                                reasoning_content: None,
+                            },
+                        );
+                        let event = serde_json::to_string(&chunk).unwrap();
+                        let _ = tx.blocking_send(Ok(Event::default().data(event)));
+                    }
+                }
 
                 // Single-shot tool-calls delta (this model emits whole blocks).
                 let mut sent_tool_calls = false;
