@@ -32,15 +32,24 @@ check() {
   fi
 }
 
-echo "== 1. Health =="
+echo "== 1. Health ==="
 health=$(curl -sf "$BASE_URL/health") || { echo "FAIL: /health unreachable"; exit 1; }
 echo "$health" | jq -e ".status == \"ok\" and .model == \"$MODEL_ID\"" >/dev/null
 check "health melaporkan $MODEL_ID" $?
+echo "$health" | jq -e '.uptime_s >= 0 and (.version | type == "string")' >/dev/null
+check "health punya uptime + version" $?
 
 echo "== 2. Models =="
 models=$(curl -sf "$BASE_URL/v1/models")
 echo "$models" | jq -e ".data[0].id == \"$MODEL_ID\"" >/dev/null
 check "models mencantumkan $MODEL_ID" $?
+
+echo "== 2b. Metrics =="
+metrics=$(curl -sf "$BASE_URL/metrics") || { echo "FAIL: /metrics unreachable"; exit 1; }
+echo "$metrics" | grep -q "llm_api_requests_total"
+check "metrics punya llm_api_requests_total" $?
+echo "$metrics" | grep -q "llm_api_build_info{"
+check "metrics punya llm_api_build_info" $?
 
 echo "== 3. Chat non-streaming =="
 resp=$(curl -sf "${AUTH[@]}" -H "Content-Type: application/json" \
@@ -50,6 +59,8 @@ echo "$resp" | jq -e '.choices[0].message.content | type == "string"' >/dev/null
 check "non-streaming mengembalikan content" $?
 echo "$resp" | jq -e '.usage.total_tokens > 0' >/dev/null
 check "non-streaming berisi usage" $?
+echo "$resp" | jq -e '.usage.duration_ms > 0 and .usage.tokens_per_second > 0' >/dev/null
+check "non-streaming berisi timing (duration_ms + tok/s)" $?
 
 echo "== 4. Chat streaming =="
 stream=$(curl -sfN "${AUTH[@]}" -H "Content-Type: application/json" \

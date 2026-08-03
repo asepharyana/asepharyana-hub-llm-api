@@ -10,7 +10,23 @@ OpenAI-compatible LLM inference server using `llama-cpp-2` (Rust).
 
 ### `GET /health`
 ```json
-{"status": "ok", "model": "minicpm5-1b-fable5-v2-thinking"}
+{"status": "ok", "model": "minicpm5-1b-fable5-v2-thinking", "uptime_s": 1234, "n_ctx": 8192, "version": "0.1.0"}
+```
+
+### `GET /metrics`
+Prometheus text exposition (no auth) — request counters, token usage, generation
+latency/throughput, process uptime:
+
+```
+llm_api_requests_total            # total /v1/chat/completions
+llm_api_errors_total              # errored requests
+llm_api_streaming_requests_total  # stream: true requests
+llm_api_aborted_requests_total    # aborted generations (client disconnect)
+llm_api_prompt_tokens_total       # prompt tokens accepted
+llm_api_completion_tokens_total   # tokens generated
+llm_api_generation_ms_total       # generation time (ms)
+llm_api_tokens_per_second         # lifetime throughput gauge
+llm_api_build_info{version,model} # identity
 ```
 
 ### `GET /v1/models`
@@ -53,6 +69,7 @@ MODEL_PATH=/path/to/model.gguf ./target/release/llm-api
 | `SERVER_PORT` | `4010` | Listen port |
 | `RUST_LOG` | `info` | Log level |
 | `N_CTX` / `N_BATCH` / `N_THREADS` | `8192` / `512` / `4` | llama.cpp context/batch/threads |
+| `MAX_TOKENS` | `2048` | Hard cap untuk `max_tokens` request (0 = unlimited) |
 
 ### Smoke test (setelah deploy)
 
