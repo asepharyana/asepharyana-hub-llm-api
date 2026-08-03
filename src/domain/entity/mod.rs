@@ -104,7 +104,7 @@ pub struct ResponseMessage {
     pub tool_calls: Option<Vec<ToolCall>>,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Clone)]
 pub struct Usage {
     pub prompt_tokens: u32,
     pub completion_tokens: u32,
@@ -140,6 +140,36 @@ pub struct ToolCallResponse {
 }
 
 // ═══════════════════════════════════════════════════════════════
+//  GENERATION FINISH REASON
+// ═══════════════════════════════════════════════════════════════
+
+/// Why a generation run stopped. Produced by the engine and rendered as the
+/// OpenAI `finish_reason` at the presentation layer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FinishReason {
+    /// Natural end-of-generation (EOS token) or a stop sequence matched.
+    Stop,
+    /// `max_tokens` exhausted.
+    Length,
+    /// A complete `<tool_call>` block was emitted.
+    ToolCalls,
+    /// Generation aborted early (e.g. client disconnected).
+    Aborted,
+}
+
+impl FinishReason {
+    /// Map to the OpenAI-compatible `finish_reason` string.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            FinishReason::Stop => "stop",
+            FinishReason::Length => "length",
+            FinishReason::ToolCalls => "tool_calls",
+            FinishReason::Aborted => "stop",
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════
 //  SSE (STREAMING) TYPES
 // ═══════════════════════════════════════════════════════════════
 
@@ -151,6 +181,59 @@ pub struct SseChunk {
     pub created: i64,
     pub model: String,
     pub choices: Vec<SseChoice>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub usage: Option<Usage>,
+}
+
+impl SseChunk {
+    /// A delta chunk carrying partial reasoning/content/tool-call output.
+    pub fn delta(id: String, created: i64, model: String, delta: SseDelta) -> Self {
+        Self {
+            id,
+            object: "chat.completion.chunk".into(),
+            created,
+            model,
+            choices: vec![SseChoice {
+                index: 0,
+                delta,
+                finish_reason: None,
+            }],
+            usage: None,
+        }
+    }
+
+    /// The final chunk carrying the `finish_reason` (no token deltas).
+    pub fn finish(id: String, created: i64, model: String, finish_reason: &str) -> Self {
+        Self {
+            id,
+            object: "chat.completion.chunk".into(),
+            created,
+            model,
+            choices: vec![SseChoice {
+                index: 0,
+                delta: SseDelta {
+                    role: None,
+                    content: None,
+                    tool_calls: None,
+                    reasoning_content: None,
+                },
+                finish_reason: Some(finish_reason.into()),
+            }],
+            usage: None,
+        }
+    }
+
+    /// A trailing chunk with token usage and empty choices (OpenAI convention).
+    pub fn usage(id: String, created: i64, model: String, usage: Usage) -> Self {
+        Self {
+            id,
+            object: "chat.completion.chunk".into(),
+            created,
+            model,
+            choices: vec![],
+            usage: Some(usage),
+        }
+    }
 }
 
 #[derive(Serialize)]

@@ -168,7 +168,7 @@ async function send() {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        model: '',
+        model: 'minicpm5-1b-fable5-v2-thinking',
         messages: messages.slice(-5),  // keep context window manageable
         stream: true,
         max_tokens: 1024,

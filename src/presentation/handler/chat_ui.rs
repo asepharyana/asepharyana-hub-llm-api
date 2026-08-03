@@ -9,7 +9,10 @@ const HTML: &str = include_str!("chat-ui/index.html");
 pub async fn chat_ui() -> Response {
     (
         StatusCode::OK,
-        [(header::CONTENT_TYPE, HeaderValue::from_static("text/html; charset=utf-8"))],
+        [(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("text/html; charset=utf-8"),
+        )],
         HTML,
     )
         .into_response()

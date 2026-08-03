@@ -8,6 +8,7 @@ use crate::domain::entity::HealthResponse;
 pub async fn health_check() -> Json<HealthResponse> {
     Json(HealthResponse {
         status: "ok".into(),
-        model: format!("{MODEL_ID}-q8_0"),
+        // Report the exact model id served by /v1/models (no extra suffix).
+        model: MODEL_ID.into(),
     })
 }

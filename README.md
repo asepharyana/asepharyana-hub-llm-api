@@ -2,7 +2,7 @@
 
 OpenAI-compatible LLM inference server using `llama-cpp-2` (Rust).
 
-**Model:** MiniCPM-V-4.6 Q4_K_M (505 MB)  
+**Model:** MiniCPM5-1B-Claude-Opus-Fable5-V2-Thinking (Q8_0)  
 **Engine:** llama.cpp via `llama-cpp-2` crate  
 **Domain:** [ai.asepharyana.my.id](https://ai.asepharyana.my.id)
 
@@ -10,7 +10,7 @@ OpenAI-compatible LLM inference server using `llama-cpp-2` (Rust).
 
 ### `GET /health`
 ```json
-{"status": "ok", "model": "minicpm-v-4.6-q4_k_m"}
+{"status": "ok", "model": "minicpm5-1b-fable5-v2-thinking"}
 ```
 
 ### `GET /v1/models`
@@ -19,11 +19,13 @@ OpenAI-compatible model listing.
 ### `POST /v1/chat/completions`
 OpenAI-compatible chat completions.
 
+The server serves a single model and rejects unknown model ids with `400`:
+
 ```bash
 curl https://ai.asepharyana.my.id/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{
-    "model": "minicpm-v-4.6",
+    "model": "minicpm5-1b-fable5-v2-thinking",
     "messages": [{"role": "user", "content": "Hello!"}],
     "max_tokens": 100
   }'
@@ -42,6 +44,23 @@ MODEL_PATH=/path/to/model.gguf ./target/release/llm-api
 ./target/release/llm-api
 ```
 
+### Environment variables
+
+| Var | Default | Description |
+|-----|---------|-------------|
+| `MODEL_PATH` | `/models/MiniCPM5-1B-Claude-Opus-Fable5-V2-Thinking-Q8_0.gguf` | GGUF model file |
+| `API_KEY` | *(empty = auth off)* | Bearer token required on `/v1/chat/completions` |
+| `SERVER_PORT` | `4010` | Listen port |
+| `RUST_LOG` | `info` | Log level |
+| `N_CTX` / `N_BATCH` / `N_THREADS` | `8192` / `512` / `4` | llama.cpp context/batch/threads |
+
+### Smoke test (setelah deploy)
+
+```bash
+./scripts/smoke-test.sh http://127.0.0.1:4010        # tanpa auth
+./scripts/smoke-test.sh https://ai.asepharyana.my.id "$API_KEY"
+```
+
 ## Deploy (Nix + systemd)
 
 ```bash
@@ -52,6 +71,9 @@ nix build .#default --impure --option sandbox false
 > **Legacy (2026-08-02):** Docker compose dihapus dari produksi. Deploy sekarang Nix+systemd.
 
 ## Benchmark
+
+> *Historic* (MiniCPM-V-4.6). Kept for reference; numbers predate the current
+> MiniCPM5-1B Thinking model.
 
 | Framework | Model Size | tok/s | vs PyTorch |
 |-----------|-----------|-------|------------|

@@ -4,6 +4,7 @@
 //! lifetime transmute), tokenization, and generation.
 
 use std::num::NonZeroU32;
+use std::sync::Mutex;
 
 use llama_cpp_2::context::params::LlamaContextParams;
 use llama_cpp_2::context::LlamaContext;
@@ -14,10 +15,10 @@ use llama_cpp_2::model::{AddBos, LlamaModel};
 use llama_cpp_2::sampling::LlamaSampler;
 use llama_cpp_2::token::LlamaToken;
 use llama_cpp_2::TokenToStringError;
-use tokio::sync::Mutex;
 use tracing::info;
 
 use crate::config::CONFIG;
+use crate::domain::entity::FinishReason;
 use crate::domain::LlmError;
 
 // ── Thread-safe wrapper for raw llama.cpp context ──
@@ -95,17 +96,28 @@ impl CtxInner {
 
 // ── LlamaEngine ──
 
+/// Outcome of a generation run.
+pub struct GenerationOutcome {
+    /// Generated tokens (stop-sequence and EOG tokens are excluded).
+    pub tokens: Vec<LlamaToken>,
+    /// Accumulated decoded text (raw, before markup/special-token cleaning).
+    pub text: String,
+    /// Why generation stopped.
+    pub finish: FinishReason,
+}
+
 /// Safe interface to a llama.cpp model and inference context.
 ///
 /// All access to the underlying context is serialized through a `Mutex`,
 /// so only one generation can happen at a time. This is intentional —
-/// the model is designed for sequential inference.
+/// the model is designed for sequential inference. Generation is synchronous
+/// and must be invoked from the tokio blocking pool (`spawn_blocking`).
 pub struct LlamaEngine {
     /// The loaded model (read-only after load, safe to share).
     pub model: LlamaModel,
 
     /// The inference context (single-threaded access via Mutex).
-    pub ctx: Mutex<CtxInner>,
+    ctx: Mutex<CtxInner>,
 }
 
 impl LlamaEngine {
@@ -117,17 +129,17 @@ impl LlamaEngine {
     /// cannot be created.
     pub fn load() -> Result<Self, LlmError> {
         info!("Initializing llama backend...");
-        let backend = LlamaBackend::init().map_err(|e| {
-            LlmError::Model(format!("Backend init failed: {e}"))
-        })?;
+        let backend = LlamaBackend::init()
+            .map_err(|e| LlmError::Model(format!("Backend init failed: {e}")))?;
 
         // Backend must outlive model and context. We leak it to achieve 'static
         // lifetime since the engine lives for the program lifetime.
         let backend: &'static LlamaBackend = Box::leak(Box::new(backend));
 
         info!("Loading model: {}", CONFIG.model_path);
-        let model = LlamaModel::load_from_file(backend, &CONFIG.model_path, &LlamaModelParams::default())
-            .map_err(|e| LlmError::Model(format!("Failed to load model: {e}")))?;
+        let model =
+            LlamaModel::load_from_file(backend, &CONFIG.model_path, &LlamaModelParams::default())
+                .map_err(|e| LlmError::Model(format!("Failed to load model: {e}")))?;
         info!("  Vocab: {}", model.n_vocab());
         info!("  Params: {}", model.n_params());
         info!("  Layers: {}", model.n_layer());
@@ -156,9 +168,12 @@ impl LlamaEngine {
     }
 
     /// Tokenize a prompt string into tokens.
+    ///
+    /// `AddBos::Never`: the chat template already prepends the `<s>` BOS token,
+    /// so adding another here would produce a double BOS.
     pub fn tokenize(&self, prompt: &str) -> Result<Vec<LlamaToken>, LlmError> {
         self.model
-            .str_to_token(prompt, AddBos::Always)
+            .str_to_token(prompt, AddBos::Never)
             .map_err(|e| LlmError::Model(format!("Tokenization failed: {e}")))
     }
 
@@ -177,37 +192,28 @@ impl LlamaEngine {
         String::from_utf8(bytes).unwrap_or_default()
     }
 
-    /// Decode multiple tokens to a single string.
-    pub fn decode_tokens(&self, tokens: &[LlamaToken]) -> String {
-        let mut out = String::with_capacity(tokens.len() * 4);
-        for &token in tokens {
-            out.push_str(&self.decode_token(token));
-        }
-        out
-    }
-
-    /// Check if a token is an end-of-generation token.
-    pub fn is_eog(&self, token: LlamaToken) -> bool {
-        self.model.is_eog_token(token)
-    }
-
-    /// Return a reference to the context mutex for advanced operations.
-    pub fn ctx(&self) -> &Mutex<CtxInner> {
-        &self.ctx
-    }
-
-    /// Generate tokens (non-streaming) and return output tokens, cleaned text, and tool calls.
+    /// Generate tokens and invoke `on_token` for each one.
     ///
-    /// Locks the context mutex, prefill the prompt, then iterates sampling + decoding
-    /// until EOG, max_tokens, stop sequence, or tool call completion.
-    pub async fn generate(
+    /// Synchronous (CPU-bound) — call from `spawn_blocking`. Locks the context,
+    /// prefills the prompt, then iterates sampling + decoding until EOG,
+    /// `max_tokens`, a stop sequence, or a complete `<tool_call>` block.
+    ///
+    /// `on_token` is invoked for every generated token (after leading-EOG
+    /// skipping, before it is decoded into the KV cache) and may return `false`
+    /// to abort early (e.g. the streaming client disconnected).
+    pub fn generate(
         &self,
         input_tokens: &[LlamaToken],
-        sampler: &mut SendSampler,
+        sampler: &mut LlamaSampler,
         max_tokens: u32,
         stop: &[String],
-    ) -> Result<(Vec<LlamaToken>, String), LlmError> {
-        let mut inner = self.ctx.lock().await;
+        enable_tool_detection: bool,
+        on_token: &mut dyn FnMut(LlamaToken, &str) -> bool,
+    ) -> Result<GenerationOutcome, LlmError> {
+        let mut inner = self
+            .ctx
+            .lock()
+            .map_err(|_| LlmError::Internal("context mutex poisoned".into()))?;
         inner.clear();
         inner
             .prefill(input_tokens)
@@ -215,59 +221,66 @@ impl LlamaEngine {
 
         let mut output: Vec<LlamaToken> = Vec::new();
         let mut text_buf = String::new();
-        let mut stop_now = false;
+        let mut finish = FinishReason::Length;
 
         let mut current = inner.sample(sampler);
 
-        // Skip leading EOS tokens (like <|im_end|> as first token)
+        // Skip leading EOG tokens (like a stray <|im_end|> right after the prompt)
         while output.is_empty() && self.model.is_eog_token(current) {
             let pos = input_tokens.len() as i32 + output.len() as i32;
-            if let Err(e) = inner.decode(current, pos) {
-                tracing::info!("  Decode error: {e}");
-                break;
-            }
+            inner
+                .decode(current, pos)
+                .map_err(|e| LlmError::Model(format!("Decode: {e}")))?;
             current = inner.sample(sampler);
         }
 
         for _ in 0..max_tokens {
             if self.model.is_eog_token(current) {
+                finish = FinishReason::Stop;
+                break;
+            }
+
+            let piece = self.decode_token(current);
+
+            // Check stop sequences *before* committing, so the stop tokens never
+            // leak into the output text or the stream.
+            if stop
+                .iter()
+                .any(|s| !s.is_empty() && format!("{text_buf}{piece}").contains(s))
+            {
+                finish = FinishReason::Stop;
                 break;
             }
 
             let pos = input_tokens.len() as i32 + output.len() as i32;
             output.push(current);
-
-            let piece = self.decode_token(current);
             text_buf.push_str(&piece);
 
-            // Check stop sequences
-            for s in stop {
-                if text_buf.contains(s) {
-                    stop_now = true;
-                    break;
-                }
-            }
-            if stop_now {
-                break;
-            }
-
-            // Check for tool_call block completion
-            if text_buf.contains("<tool_call>") {
-                let close_count = text_buf.matches("</tool_call>").count();
-                let open_count = text_buf.matches("<tool_call>").count();
-                if open_count > 0 && close_count >= open_count {
+            // Complete <tool_call> block emitted?
+            if enable_tool_detection && text_buf.contains("<tool_call>") {
+                let open = text_buf.matches("<tool_call>").count();
+                let close = text_buf.matches("</tool_call>").count();
+                if close >= open {
+                    finish = FinishReason::ToolCalls;
                     break;
                 }
             }
 
-            if let Err(e) = inner.decode(current, pos) {
-                tracing::info!("  Decode error: {e}");
+            if !on_token(current, &piece) {
+                finish = FinishReason::Aborted;
                 break;
             }
 
+            inner
+                .decode(current, pos)
+                .map_err(|e| LlmError::Model(format!("Decode: {e}")))?;
             current = inner.sample(sampler);
         }
 
-        Ok((output, text_buf))
+        Ok(GenerationOutcome {
+            tokens: output,
+            text: text_buf,
+            finish,
+        })
     }
 }

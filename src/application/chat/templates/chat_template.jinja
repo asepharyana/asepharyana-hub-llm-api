@@ -6,7 +6,7 @@
             {{- "\n" }}
             {{- tool | tojson }}
         {%- endfor %}
-        {{- '\n</tools>\n\nTool usage guidelines:\n- You may call zero or more functions. If no function calls are needed, just answer normally.\n- When calling a function, use: <function name="name"><param name="key">value</param></function>' }}
+        {{- '\n</tools>\n\nTool usage guidelines:\n- You may call zero or more functions. If no function calls are needed, just answer normally.\n- When calling a function, wrap each call in <tool_call> tags:\n<tool_call>\n<function=name>\n<parameter=key>value</parameter>\n</function>\n</tool_call>' }}
     {%- endset %}
 
     {{- '<|im_start|>system\n' }}
@@ -26,17 +26,8 @@
     {%- if (message.role == "user") or (message.role == "system" and not loop.first) %}
         {{- '<|im_start|>' + message.role + '\n' + content + '<|im_end|>' + '\n' }}
     {%- elif message.role == "assistant" %}
-        {%- if message.tool_calls %}
-            {%- set content = message.content %}
-            {%- for tool_call in message.tool_calls %}
-                {%- if tool_call.type == "function" %}
-                    {%- set content = content + "\n<tool_call>\n<function=" + tool_call.function.name + ">\n" + (tool_call.function.arguments | tojson) + "\n</function>\n</tool_call>" %}
-                {%- endif %}
-            {%- endfor %}
-            {{- '<|im_start|>assistant\n' + content + '<|im_end|>\n' }}
-        {%- else %}
-            {{- '<|im_start|>assistant\n' + content + '<|im_end|>\n' }}
-        {%- endif %}
+        {#- Tool-call XML from history is pre-embedded in content by build_prompt. #}
+        {{- '<|im_start|>assistant\n' + content + '<|im_end|>\n' }}
     {%- elif message.role == "tool" %}
         {{- '<|im_start|>user\n<tool_response>\n' + content + '\n</tool_response><|im_end|>\n' }}
     {%- endif %}

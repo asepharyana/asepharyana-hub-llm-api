@@ -32,15 +32,12 @@ impl Application {
     pub async fn build() -> anyhow::Result<Self> {
         // Initialize tracing
         let env_filter = EnvFilter::new(&CONFIG.log_level);
-        tracing_subscriber::fmt()
-            .with_env_filter(env_filter)
-            .init();
+        tracing_subscriber::fmt().with_env_filter(env_filter).init();
         tracing::info!("🚀 LLM API starting up...");
 
         // Load model (fail-fast)
-        let engine = LlamaEngine::load().map_err(|e| {
-            anyhow::anyhow!("Failed to initialize LLM engine: {e}")
-        })?;
+        let engine = LlamaEngine::load()
+            .map_err(|e| anyhow::anyhow!("Failed to initialize LLM engine: {e}"))?;
         let engine = Arc::new(engine);
 
         let state = Arc::new(AppState { engine });
@@ -51,10 +48,7 @@ impl Application {
         // Bind listener
         let addr = format!("0.0.0.0:{}", CONFIG.server_port);
         let listener = TcpListener::bind(&addr).await?;
-        tracing::info!(
-            "Server listening on {}",
-            listener.local_addr()?
-        );
+        tracing::info!("Server listening on {}", listener.local_addr()?);
 
         Ok(Self {
             port: CONFIG.server_port,

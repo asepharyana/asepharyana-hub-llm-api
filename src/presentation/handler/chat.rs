@@ -1,12 +1,18 @@
 //! Chat completions endpoint — streaming and non-streaming.
+//!
+//! Both paths share the same synchronous generation core
+//! ([`LlamaEngine::generate`]), which runs on the tokio blocking pool via
+//! `spawn_blocking` so worker threads are not hogged by CPU-bound inference.
+//! The streaming path forwards each generated token into an SSE channel.
 
 use std::convert::Infallible;
 use std::sync::Arc;
 
 use axum::extract::State;
-use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::http::HeaderMap;
-use axum::{Json, response::{IntoResponse, Response}};
+use axum::response::sse::{Event, KeepAlive, Sse};
+use axum::response::{IntoResponse, Response};
+use axum::Json;
 use chrono::Utc;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
@@ -14,7 +20,7 @@ use tracing::info;
 
 use crate::application::chat;
 use crate::domain::entity::{
-    ChatRequest, ChatResponse, Choice, ResponseMessage, SseChunk, SseChoice, SseDelta, Usage,
+    ChatRequest, ChatResponse, Choice, FinishReason, ResponseMessage, SseChunk, SseDelta, Usage,
 };
 use crate::infrastructure::llama::SendSampler;
 use crate::presentation::error::AppError;
@@ -25,12 +31,14 @@ pub async fn chat_completions(
     State(state): State<Arc<AppState>>,
     Json(req): Json<ChatRequest>,
 ) -> Result<Response, AppError> {
+    // Strict model validation — reject unknown model ids up front.
+    chat::validate_model(&req.model).map_err(AppError::BadRequest)?;
+
     let max_tokens = req.max_tokens.unwrap_or(256).min(1024);
     let stop = req.stop.clone().unwrap_or_default();
-    let prompt = chat::build_prompt(&state.engine.model, &req.messages, &req.tools)
-        .map_err(|e| AppError::LlmError(e))?;
+    let prompt = chat::build_prompt(&req.messages, &req.tools).map_err(AppError::LlmError)?;
 
-    // Tokenize
+    // Tokenize (fast — keep on the async thread).
     let input_tokens = state
         .engine
         .tokenize(&prompt)
@@ -38,7 +46,7 @@ pub async fn chat_completions(
 
     let prompt_tokens = input_tokens.len() as u32;
     info!(
-        "  Chat: {} prompt tokens, max_tokens={}, tools={}",
+        "Chat: {} prompt tokens, max_tokens={}, tools={}",
         prompt_tokens,
         max_tokens,
         req.tools.as_ref().is_some_and(|t| !t.is_empty())
@@ -49,7 +57,7 @@ pub async fn chat_completions(
     } else {
         handle_non_streaming(state.clone(), req, max_tokens, stop, input_tokens).await?
     };
-    Ok(response.into_response())
+    Ok(response)
 }
 
 // ── Non-streaming path ──
@@ -66,28 +74,41 @@ async fn handle_non_streaming(
     let prompt_tokens = input_tokens.len() as u32;
     let has_tools = req.tools.as_ref().is_some_and(|t| !t.is_empty());
     let params = chat::SamplerParams::from_request(&req);
-    let mut sampler = SendSampler(chat::build_sampler(&params));
 
-    let (output_tokens, raw_text) = state
-        .engine
-        .generate(&input_tokens, &mut sampler, max_tokens, &stop)
-        .await?;
+    let engine = state.engine.clone();
+    let outcome = tokio::task::spawn_blocking(move || {
+        let mut sampler = SendSampler(chat::build_sampler(&params));
+        engine.generate(
+            &input_tokens,
+            &mut sampler,
+            max_tokens,
+            &stop,
+            has_tools,
+            &mut |_token, _piece| true,
+        )
+    })
+    .await
+    .map_err(|e| AppError::Internal(format!("Generation task panicked: {e}")))?
+    .map_err(AppError::from)?;
 
-    let (reasoning, cleaned) = chat::clean_text(&raw_text);
-    let (output_text, tool_calls) = chat::parse_tool_calls(&cleaned);
-
-    let completion_tokens = output_tokens.len() as u32;
+    let completion_tokens = outcome.tokens.len() as u32;
     info!("  {} generated tokens", completion_tokens);
 
-    let finish_reason = if has_tools && !tool_calls.is_empty() {
-        "tool_calls"
-    } else if completion_tokens < max_tokens {
-        "stop"
-    } else {
-        "length"
+    let (reasoning, cleaned) = chat::clean_text(&outcome.text);
+    let (output_text, tool_calls) = chat::parse_tool_calls(&cleaned);
+
+    let finish_reason = match (outcome.finish, tool_calls.is_empty()) {
+        (FinishReason::ToolCalls, false) => "tool_calls",
+        // Model opened a <tool_call> but never completed it — don't claim a call.
+        (FinishReason::ToolCalls, true) => "stop",
+        (f, _) => f.as_str(),
     };
 
-    let reasoning_opt = if reasoning.is_empty() { None } else { Some(reasoning) };
+    let reasoning_opt = if reasoning.is_empty() {
+        None
+    } else {
+        Some(reasoning)
+    };
 
     Ok(Json(ChatResponse {
         id: chat_id,
@@ -130,309 +151,157 @@ async fn handle_streaming(
     let created = Utc::now().timestamp();
     let has_tools = req.tools.as_ref().is_some_and(|t| !t.is_empty());
     let model_name = req.model.clone();
+    let prompt_tokens = input_tokens.len() as u32;
     let params = chat::SamplerParams::from_request(&req);
+
     let (tx, rx) = mpsc::channel::<Result<Event, Infallible>>(64);
 
-    tokio::spawn(async move {
-        // Role chunk
-        let role_chunk = serde_json::to_string(&SseChunk {
-            id: chat_id.clone(),
-            object: "chat.completion.chunk".into(),
-            created,
-            model: model_name.clone(),
-            choices: vec![SseChoice {
-                index: 0,
-                delta: SseDelta {
-                    role: Some("assistant".into()),
-                    content: None,
-                    tool_calls: None,
-                    reasoning_content: None,
-                },
-                finish_reason: None,
-            }],
-        })
-        .unwrap();
-        if tx.send(Ok(Event::default().data(role_chunk))).await.is_err() {
-            return;
-        }
+    // First chunk: announce the assistant role.
+    let role_chunk = SseChunk::delta(
+        chat_id.clone(),
+        created,
+        model_name.clone(),
+        SseDelta {
+            role: Some("assistant".into()),
+            content: None,
+            tool_calls: None,
+            reasoning_content: None,
+        },
+    );
+    let role_event = serde_json::to_string(&role_chunk).unwrap();
+    let _ = tx.send(Ok(Event::default().data(role_event))).await;
 
-        // Build sampler
+    let engine = state.engine.clone();
+    tokio::task::spawn_blocking(move || {
         let mut sampler = SendSampler(chat::build_sampler(&params));
-
-        // Lock context
-        let mut inner = state.engine.ctx().lock().await;
-        inner.clear();
-        if let Err(e) = inner.prefill(&input_tokens) {
-            info!("  Prefill error: {e}");
-            return;
-        }
-
-        let mut count = 0u32;
         let mut text_buf = String::new();
-        let mut sent_len: usize = 0;     // how many chars of text_buf have been sent
-        let mut think_done: bool = false; // true once </think> seen
-        let mut current = inner.sample(&mut sampler);
+        let mut sent_len: usize = 0;
+        let mut think_done = false;
 
-        loop {
-            if count >= max_tokens {
-                let chunk = serde_json::to_string(&SseChunk {
-                    id: chat_id.clone(),
-                    object: "chat.completion.chunk".into(),
-                    created,
-                    model: model_name.clone(),
-                    choices: vec![SseChoice {
-                        index: 0,
-                        delta: SseDelta {
+        let outcome = engine.generate(
+            &input_tokens,
+            &mut sampler,
+            max_tokens,
+            &stop,
+            has_tools,
+            &mut |_token, piece| {
+                text_buf.push_str(piece);
+
+                // `was_thinking` is passed to split_stream_chunk so the chunk
+                // containing the first </think> is treated as the boundary.
+                let was_thinking = !think_done;
+                if !think_done && text_buf.contains("</think>") {
+                    think_done = true;
+                }
+
+                let new_text = &text_buf[sent_len..];
+                if new_text.is_empty() {
+                    return true;
+                }
+
+                let (reasoning, content) = chat::split_stream_chunk(new_text, was_thinking);
+
+                if let Some(reasoning) = reasoning {
+                    let chunk = SseChunk::delta(
+                        chat_id.clone(),
+                        created,
+                        model_name.clone(),
+                        SseDelta {
                             role: None,
                             content: None,
                             tool_calls: None,
+                            reasoning_content: Some(reasoning),
+                        },
+                    );
+                    let event = serde_json::to_string(&chunk).unwrap();
+                    if tx.blocking_send(Ok(Event::default().data(event))).is_err() {
+                        return false;
+                    }
+                }
+
+                if !content.is_empty() {
+                    let chunk = SseChunk::delta(
+                        chat_id.clone(),
+                        created,
+                        model_name.clone(),
+                        SseDelta {
+                            role: None,
+                            content: Some(content),
+                            tool_calls: None,
                             reasoning_content: None,
                         },
-                        finish_reason: Some("length".into()),
-                    }],
-                })
-                .unwrap();
-                let _ = tx.send(Ok(Event::default().data(chunk))).await;
-                break;
-            }
+                    );
+                    let event = serde_json::to_string(&chunk).unwrap();
+                    if tx.blocking_send(Ok(Event::default().data(event))).is_err() {
+                        return false;
+                    }
+                }
 
-            // Skip leading EOS tokens (like <|im_end|> at start of generation)
-            if state.engine.is_eog(current) && text_buf.is_empty() {
-                // safety bound: don't skip more than 10
-                if count >= max_tokens || count > 10 {
-                    let chunk = serde_json::to_string(&SseChunk {
-                        id: chat_id.clone(),
-                        object: "chat.completion.chunk".into(),
-                        created,
-                        model: model_name.clone(),
-                        choices: vec![SseChoice {
-                            index: 0,
-                            delta: SseDelta {
+                sent_len = text_buf.len();
+                true
+            },
+        );
+
+        match outcome {
+            Ok(outcome) => {
+                let completion_tokens = outcome.tokens.len() as u32;
+                let usage = Usage {
+                    prompt_tokens,
+                    completion_tokens,
+                    total_tokens: prompt_tokens + completion_tokens,
+                };
+
+                // Single-shot tool-calls delta (this model emits whole blocks).
+                let mut sent_tool_calls = false;
+                if outcome.finish == FinishReason::ToolCalls {
+                    let (_cleaned, calls) = chat::parse_tool_calls(&outcome.text);
+                    if !calls.is_empty() {
+                        sent_tool_calls = true;
+                        let chunk = SseChunk::delta(
+                            chat_id.clone(),
+                            created,
+                            model_name.clone(),
+                            SseDelta {
                                 role: None,
                                 content: None,
-                                tool_calls: None,
+                                tool_calls: Some(calls),
                                 reasoning_content: None,
                             },
-                            finish_reason: Some("stop".into()),
-                        }],
-                    })
-                    .unwrap();
-                    let _ = tx.send(Ok(Event::default().data(chunk))).await;
-                    break;
+                        );
+                        let event = serde_json::to_string(&chunk).unwrap();
+                        let _ = tx.blocking_send(Ok(Event::default().data(event)));
+                    }
                 }
-                count += 1;
-                let pos = input_tokens.len() as i32 + count as i32;
-                if let Err(e) = inner.decode(current, pos) {
-                    info!("  Decode error: {e}");
-                    break;
-                }
-                current = inner.sample(&mut sampler);
-                continue;
-            }
 
-            if state.engine.is_eog(current) {
-                let reason = if has_tools && text_buf.contains("<tool_call>") {
-                    "tool_calls"
-                } else {
-                    "stop"
+                let finish_reason = match (outcome.finish, sent_tool_calls) {
+                    (FinishReason::ToolCalls, true) => "tool_calls",
+                    (FinishReason::ToolCalls, false) => "stop",
+                    (f, _) => f.as_str(),
                 };
-                let chunk = serde_json::to_string(&SseChunk {
-                    id: chat_id.clone(),
-                    object: "chat.completion.chunk".into(),
-                    created,
-                    model: model_name.clone(),
-                    choices: vec![SseChoice {
-                        index: 0,
-                        delta: SseDelta {
-                            role: None,
-                            content: None,
-                            tool_calls: None,
-                            reasoning_content: None,
-                        },
-                        finish_reason: Some(reason.into()),
-                    }],
-                })
-                .unwrap();
-                let _ = tx.send(Ok(Event::default().data(chunk))).await;
-                break;
+
+                let finish_chunk =
+                    SseChunk::finish(chat_id.clone(), created, model_name.clone(), finish_reason);
+                let event = serde_json::to_string(&finish_chunk).unwrap();
+                let _ = tx.blocking_send(Ok(Event::default().data(event)));
+
+                let usage_chunk = SseChunk::usage(chat_id, created, model_name, usage);
+                let event = serde_json::to_string(&usage_chunk).unwrap();
+                let _ = tx.blocking_send(Ok(Event::default().data(event)));
             }
-
-            let piece = state.engine.decode_token(current);
-
-            // Push into buffer
-            text_buf.push_str(&piece);
-
-            // Detect </think> transition
-            if !think_done && text_buf.contains("</think>") {
-                think_done = true;
+            Err(e) => {
+                // Surface the error instead of silently truncating the stream.
+                let error_body = serde_json::json!({
+                    "error": {
+                        "message": e.to_string(),
+                        "type": "server_error",
+                    }
+                });
+                let _ = tx.blocking_send(Ok(Event::default().data(error_body.to_string())));
             }
-
-            // Find new text since last send
-            let new_text = &text_buf[sent_len..]; // everything not yet streamed
-            if new_text.is_empty() {
-                // Nothing new to send; skip straight to decode
-                let pos = input_tokens.len() as i32 + count as i32;
-                if let Err(e) = inner.decode(current, pos) {
-                    info!("  Decode error: {e}");
-                    break;
-                }
-                count += 1;
-                current = inner.sample(&mut sampler);
-                continue;
-            }
-
-            // Strip special tokens from the NEW text chunk
-            // Split at </think> if present — before goes to reasoning, after to content
-            let (reasoning_part, content_part) = if let Some(pos) = new_text.find("</think>") {
-                let before = new_text[..pos]
-                    .replace("<|im_end|>", "")
-                    .replace("<|im_start|>", "")
-                    .replace("<think>", "")
-                    .trim()
-                    .to_string();
-                let after = new_text[pos + 8..]
-                    .replace("<|im_end|>", "")
-                    .replace("<|im_start|>", "")
-                    .replace("<think>", "")
-                    .trim()
-                    .to_string();
-                think_done = true;
-                (Some(before), after)
-            } else if think_done {
-                let cleaned = new_text
-                    .replace("<|im_end|>", "")
-                    .replace("<|im_start|>", "")
-                    .replace("<think>", "")
-                    .trim()
-                    .to_string();
-                (None, cleaned)
-            } else {
-                let cleaned = new_text
-                    .replace("<|im_end|>", "")
-                    .replace("<|im_start|>", "")
-                    .replace("<think>", "")
-                    .trim()
-                    .to_string();
-                (Some(cleaned), String::new())
-            };
-
-            // Send reasoning part (before </think>, or entire text if still thinking)
-            if let Some(ref r) = reasoning_part {
-                if !r.is_empty() {
-                    let delta = SseDelta {
-                        role: None,
-                        content: None,
-                        reasoning_content: Some(r.clone()),
-                        tool_calls: None,
-                    };
-                    let chunk = serde_json::to_string(&SseChunk {
-                        id: chat_id.clone(),
-                        object: "chat.completion.chunk".into(),
-                        created,
-                        model: model_name.clone(),
-                        choices: vec![SseChoice {
-                            index: 0,
-                            delta,
-                            finish_reason: None,
-                        }],
-                    })
-                    .unwrap();
-                    let _ = tx.send(Ok(Event::default().data(chunk))).await;
-                }
-            }
-
-            // Send content part (after </think>, or never if model doesn't think)
-            if !content_part.is_empty() {
-                let delta = SseDelta {
-                    role: None,
-                    content: Some(content_part),
-                    reasoning_content: None,
-                    tool_calls: None,
-                };
-                let chunk = serde_json::to_string(&SseChunk {
-                    id: chat_id.clone(),
-                    object: "chat.completion.chunk".into(),
-                    created,
-                    model: model_name.clone(),
-                    choices: vec![SseChoice {
-                        index: 0,
-                        delta,
-                        finish_reason: None,
-                    }],
-                })
-                .unwrap();
-                if tx.send(Ok(Event::default().data(chunk))).await.is_err() {
-                    break;
-                }
-            }
-
-            sent_len = text_buf.len();
-
-            // Check stop sequences
-            let mut stop_now = false;
-            for s in &stop {
-                if text_buf.contains(s) {
-                    stop_now = true;
-                    break;
-                }
-            }
-            if stop_now {
-                let chunk = serde_json::to_string(&SseChunk {
-                    id: chat_id.clone(),
-                    object: "chat.completion.chunk".into(),
-                    created,
-                    model: model_name.clone(),
-                    choices: vec![SseChoice {
-                        index: 0,
-                        delta: SseDelta {
-                            role: None,
-                            content: None,
-                            tool_calls: None,
-                            reasoning_content: None,
-                        },
-                        finish_reason: Some("stop".into()),
-                    }],
-                })
-                .unwrap();
-                let _ = tx.send(Ok(Event::default().data(chunk))).await;
-                break;
-            }
-
-            // Check tool call completeness
-            if has_tools && text_buf.contains("<tool_call>") {
-                let open = text_buf.matches("<tool_call>").count();
-                let close = text_buf.matches("</tool_call>").count();
-                if close >= open {
-                    let chunk = serde_json::to_string(&SseChunk {
-                        id: chat_id.clone(),
-                        object: "chat.completion.chunk".into(),
-                        created,
-                        model: model_name.clone(),
-                        choices: vec![SseChoice {
-                            index: 0,
-                            delta: SseDelta {
-                                role: None,
-                                content: None,
-                                tool_calls: None,
-                                reasoning_content: None,
-                            },
-                            finish_reason: Some("tool_calls".into()),
-                        }],
-                    })
-                    .unwrap();
-                    let _ = tx.send(Ok(Event::default().data(chunk))).await;
-                    break;
-                }
-            }
-
-            let pos = input_tokens.len() as i32 + count as i32;
-            if let Err(e) = inner.decode(current, pos) {
-                info!("  Decode error: {e}");
-                break;
-            }
-            count += 1;
-            current = inner.sample(&mut sampler);
         }
+
+        // OpenAI-compatible terminator.
+        let _ = tx.blocking_send(Ok(Event::default().data("[DONE]")));
     });
 
     let stream = ReceiverStream::new(rx);
