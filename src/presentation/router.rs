@@ -7,7 +7,7 @@ use axum::routing::{get, post};
 use axum::Router;
 use tower_http::cors::CorsLayer;
 
-use super::handler::{chat, chat_ui, health, models};
+use super::handler::{chat, chat_ui, health, metrics, models};
 use crate::presentation::middleware::auth::auth_middleware;
 use crate::presentation::state::AppState;
 
@@ -17,6 +17,7 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         // Public routes (no auth)
         .route("/", get(chat_ui::chat_ui))
         .route("/health", get(health::health_check))
+        .route("/metrics", get(metrics::metrics))
         .route("/v1/models", get(models::list_models))
         // Chat completions (auth-protected)
         .route("/v1/chat/completions", post(chat::chat_completions))

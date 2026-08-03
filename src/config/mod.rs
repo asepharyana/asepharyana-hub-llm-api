@@ -38,6 +38,9 @@ pub struct AppConfig {
 
     /// Number of CPU threads for inference
     pub n_threads: i32,
+
+    /// Hard cap for `max_tokens` in chat requests (0 = unlimited)
+    pub max_tokens: u32,
 }
 
 impl AppConfig {
@@ -55,6 +58,7 @@ impl AppConfig {
             n_ctx: env_or("N_CTX", 8192),
             n_batch: env_or("N_BATCH", 512),
             n_threads: env_or("N_THREADS", 4),
+            max_tokens: env_or("MAX_TOKENS", 2048),
         }
     }
 }

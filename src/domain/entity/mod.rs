@@ -109,6 +109,12 @@ pub struct Usage {
     pub prompt_tokens: u32,
     pub completion_tokens: u32,
     pub total_tokens: u32,
+    /// Wall-clock duration of the generation, in milliseconds.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub duration_ms: Option<u64>,
+    /// Generated tokens per second (completion_tokens / seconds).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tokens_per_second: Option<f64>,
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -278,4 +284,13 @@ pub struct ModelInfo {
 pub struct HealthResponse {
     pub status: String,
     pub model: String,
+    /// Server process uptime in seconds.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub uptime_s: Option<u64>,
+    /// llama.cpp context size (n_ctx).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub n_ctx: Option<u32>,
+    /// Server binary version (from CARGO_PKG_VERSION).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
 }

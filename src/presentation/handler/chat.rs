@@ -19,11 +19,13 @@ use tokio_stream::wrappers::ReceiverStream;
 use tracing::info;
 
 use crate::application::chat;
+use crate::config::CONFIG;
 use crate::domain::entity::{
     ChatRequest, ChatResponse, Choice, FinishReason, ResponseMessage, SseChunk, SseDelta, Usage,
 };
 use crate::infrastructure::llama::SendSampler;
 use crate::presentation::error::AppError;
+use crate::presentation::handler::metrics;
 use crate::presentation::state::AppState;
 
 /// POST /v1/chat/completions
@@ -34,7 +36,8 @@ pub async fn chat_completions(
     // Strict model validation — reject unknown model ids up front.
     chat::validate_model(&req.model).map_err(AppError::BadRequest)?;
 
-    let max_tokens = req.max_tokens.unwrap_or(256).min(1024);
+    // Cap max_tokens at the configured hard limit (0 = unlimited).
+    let max_tokens = req.max_tokens.unwrap_or(256).min(CONFIG.max_tokens.max(1));
     let stop = req.stop.clone().unwrap_or_default();
     let prompt = chat::build_prompt(&req.messages, &req.tools).map_err(AppError::LlmError)?;
 
@@ -51,6 +54,8 @@ pub async fn chat_completions(
         max_tokens,
         req.tools.as_ref().is_some_and(|t| !t.is_empty())
     );
+
+    metrics::count_request(req.stream.unwrap_or(false));
 
     let response = if req.stream.unwrap_or(false) {
         handle_streaming(state.clone(), req, max_tokens, stop, input_tokens).await?
@@ -76,6 +81,7 @@ async fn handle_non_streaming(
     let params = chat::SamplerParams::from_request(&req);
 
     let engine = state.engine.clone();
+    let gen_start = std::time::Instant::now();
     let outcome = tokio::task::spawn_blocking(move || {
         let mut sampler = SendSampler(chat::build_sampler(&params));
         engine.generate(
@@ -90,9 +96,18 @@ async fn handle_non_streaming(
     .await
     .map_err(|e| AppError::Internal(format!("Generation task panicked: {e}")))?
     .map_err(AppError::from)?;
+    let duration_ms = gen_start.elapsed().as_millis() as u64;
 
     let completion_tokens = outcome.tokens.len() as u32;
-    info!("  {} generated tokens", completion_tokens);
+    info!(
+        "  {} generated tokens in {}ms",
+        completion_tokens, duration_ms
+    );
+
+    metrics::record_tokens(prompt_tokens, completion_tokens, duration_ms);
+    if outcome.finish == FinishReason::Aborted {
+        metrics::count_aborted();
+    }
 
     let (reasoning, cleaned) = chat::clean_text(&outcome.text);
     let (output_text, tool_calls) = chat::parse_tool_calls(&cleaned);
@@ -108,6 +123,12 @@ async fn handle_non_streaming(
         None
     } else {
         Some(reasoning)
+    };
+
+    let tok_per_s = if duration_ms > 0 {
+        Some(completion_tokens as f64 / (duration_ms as f64 / 1000.0))
+    } else {
+        None
     };
 
     Ok(Json(ChatResponse {
@@ -133,6 +154,8 @@ async fn handle_non_streaming(
             prompt_tokens,
             completion_tokens,
             total_tokens: prompt_tokens + completion_tokens,
+            duration_ms: Some(duration_ms),
+            tokens_per_second: tok_per_s,
         },
     })
     .into_response())
@@ -173,6 +196,7 @@ async fn handle_streaming(
 
     let engine = state.engine.clone();
     tokio::task::spawn_blocking(move || {
+        let gen_start = std::time::Instant::now();
         let mut sampler = SendSampler(chat::build_sampler(&params));
         let mut text_buf = String::new();
         let mut sent_len: usize = 0;
@@ -249,12 +273,27 @@ async fn handle_streaming(
 
         match outcome {
             Ok(outcome) => {
+                let duration_ms = gen_start.elapsed().as_millis() as u64;
                 let completion_tokens = outcome.tokens.len() as u32;
                 let usage = Usage {
                     prompt_tokens,
                     completion_tokens,
                     total_tokens: prompt_tokens + completion_tokens,
+                    duration_ms: Some(duration_ms),
+                    tokens_per_second: if duration_ms > 0 {
+                        Some(completion_tokens as f64 / (duration_ms as f64 / 1000.0))
+                    } else {
+                        None
+                    },
                 };
+                info!(
+                    "  stream: {} generated tokens in {}ms",
+                    completion_tokens, duration_ms
+                );
+                metrics::record_tokens(prompt_tokens, completion_tokens, duration_ms);
+                if outcome.finish == FinishReason::Aborted {
+                    metrics::count_aborted();
+                }
 
                 // If the model never emitted `</think>`, everything was streamed
                 // as reasoning_content. Flush it as content so the client always
@@ -317,6 +356,7 @@ async fn handle_streaming(
             }
             Err(e) => {
                 // Surface the error instead of silently truncating the stream.
+                metrics::count_error();
                 let error_body = serde_json::json!({
                     "error": {
                         "message": e.to_string(),

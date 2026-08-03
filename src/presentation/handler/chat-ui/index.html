@@ -3,9 +3,11 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>AI Chat</title>
+<title>AI Chat — llm-api</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>✨</text></svg>">
 <style>
   *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
   :root {
     --bg: #0f0f13;
     --surface: #1a1a23;
@@ -17,71 +19,172 @@
     --accent-hover: #9484ff;
     --user-msg: #2a2a48;
     --assistant-msg: #1a1a28;
+    --code-bg: #101018;
+    --error-bg: #2a1818;
+    --error-border: #4a2828;
+    --error-text: #f08080;
     --font: system-ui, -apple-system, 'Segoe UI', sans-serif;
+    --mono: ui-monospace, SFMono-Regular, 'Cascadia Code', Consolas, monospace;
+    color-scheme: dark;
   }
+
+  [data-theme="light"] {
+    --bg: #f5f5fa;
+    --surface: #ffffff;
+    --surface2: #ececf6;
+    --border: #dcdce8;
+    --text: #1c1c2b;
+    --text2: #6b6b8d;
+    --accent: #5b4de0;
+    --accent-hover: #4a3dc8;
+    --user-msg: #dcd4ff;
+    --assistant-msg: #ffffff;
+    --code-bg: #f0f0f8;
+    --error-bg: #fdeaea;
+    --error-border: #f2c6c6;
+    --error-text: #b3261e;
+    color-scheme: light;
+  }
+
   html, body { height: 100%; background: var(--bg); color: var(--text); font-family: var(--font); }
   body { display: flex; flex-direction: column; }
 
   header {
-    padding: 16px 24px;
+    padding: 12px 24px;
     border-bottom: 1px solid var(--border);
     background: var(--surface);
     display: flex; align-items: center; gap: 12px;
     flex-shrink: 0;
+    flex-wrap: wrap;
   }
   header h1 { font-size: 18px; font-weight: 600; }
   header .badge {
     font-size: 11px; padding: 2px 10px;
     border-radius: 99px; background: var(--accent);
-    color: #fff; font-weight: 500;
+    color: #fff; font-weight: 500; white-space: nowrap;
   }
+  header .spacer { flex: 1; }
+  .header-btn {
+    padding: 6px 12px; border: 1px solid var(--border); border-radius: 8px;
+    background: transparent; color: var(--text2); cursor: pointer;
+    font-size: 12px; font-weight: 500; transition: all .15s; white-space: nowrap;
+  }
+  .header-btn:hover { color: var(--text); border-color: var(--accent); }
+  .header-btn:disabled { opacity: .4; cursor: not-allowed; }
 
   #chat-container {
     flex: 1; overflow-y: auto; padding: 24px;
     display: flex; flex-direction: column; gap: 16px;
   }
-  #chat-container:empty::after {
-    content: 'Send a message to start chatting.';
-    color: var(--text2); font-size: 14px;
-    text-align: center; margin-top: 40px;
-  }
+  .welcome { text-align: center; color: var(--text2); margin-top: 48px; font-size: 14px; line-height: 1.8; }
+  .welcome h2 { color: var(--text); font-size: 22px; margin-bottom: 8px; }
+  .welcome .hints { opacity: .85; }
 
   .msg {
-    max-width: 720px; width: fit-content;
+    max-width: 780px; width: fit-content;
     padding: 12px 16px; border-radius: 12px;
     line-height: 1.6; font-size: 14px;
-    white-space: pre-wrap; word-break: break-word;
+    word-break: break-word;
   }
   .msg.user {
     background: var(--user-msg);
     border: 1px solid var(--border);
     align-self: flex-end;
     border-bottom-right-radius: 4px;
+    white-space: pre-wrap;
   }
   .msg.assistant {
     background: var(--assistant-msg);
     border: 1px solid var(--border);
     align-self: flex-start;
     border-bottom-left-radius: 4px;
+    min-width: 200px;
   }
-  .msg.assistant:empty::after { content: '⏳'; } /* spinner when empty */
-  .msg .tool-call {
+  .msg.error {
+    background: var(--error-bg); border-color: var(--error-border); color: var(--error-text);
+  }
+
+  /* Markdown content */
+  .md > *:first-child { margin-top: 0; }
+  .md > *:last-child { margin-bottom: 0; }
+  .md p { margin: 0.4em 0; }
+  .md h1, .md h2, .md h3, .md h4 { margin: 0.9em 0 0.4em; line-height: 1.3; }
+  .md h1 { font-size: 1.35em; } .md h2 { font-size: 1.2em; } .md h3 { font-size: 1.08em; }
+  .md ul, .md ol { margin: 0.4em 0; padding-left: 1.5em; }
+  .md li { margin: 0.2em 0; }
+  .md code {
+    font-family: var(--mono); font-size: 0.88em;
+    background: var(--code-bg); border: 1px solid var(--border);
+    padding: 1px 5px; border-radius: 5px;
+  }
+  .md pre {
+    background: var(--code-bg); border: 1px solid var(--border);
+    border-radius: 10px; padding: 12px 14px; margin: 0.6em 0;
+    overflow-x: auto;
+  }
+  .md pre code { background: none; border: none; padding: 0; font-size: 0.85em; line-height: 1.5; display: block; }
+  .md blockquote {
+    border-left: 3px solid var(--accent); padding-left: 12px;
+    color: var(--text2); margin: 0.5em 0;
+  }
+  .md a { color: var(--accent); }
+  .md table { border-collapse: collapse; margin: 0.6em 0; font-size: 0.92em; }
+  .md th, .md td { border: 1px solid var(--border); padding: 6px 10px; }
+  .md th { background: var(--surface2); }
+
+  .reasoning {
+    font-size: 12.5px; font-style: italic;
+    color: var(--text2);
+    border: 1px dashed var(--border);
+    border-radius: 8px; margin-bottom: 10px; overflow: hidden;
+  }
+  .reasoning summary {
+    cursor: pointer; user-select: none;
+    padding: 6px 10px; font-style: normal; font-weight: 600;
+    color: var(--text2); display: flex; align-items: center; gap: 6px;
+  }
+  .reasoning summary::before { content: '🧠'; }
+  .reasoning summary:hover { color: var(--text); }
+  .reasoning .reasoning-body {
+    padding: 6px 12px 10px; white-space: pre-wrap; word-break: break-word;
+    border-top: 1px dashed var(--border);
+  }
+  .reasoning[open] summary { border-bottom: 1px dashed var(--border); }
+
+  .tool-call {
     margin-top: 8px; padding: 8px 12px;
     background: var(--surface2); border-radius: 8px;
     font-size: 13px; color: var(--text2);
     display: flex; align-items: center; gap: 6px;
   }
-  .msg .tool-call::before { content: '\1F527'; }
-  .msg .reasoning {
-    font-size: 12px; font-style: italic;
-    color: var(--text2);
-    white-space: pre-wrap; word-break: break-word;
-    border-bottom: 1px solid var(--border);
-    padding-bottom: 8px; margin-bottom: 8px;
+  .tool-call::before { content: '🔧'; }
+
+  .msg-stats {
+    margin-top: 10px; padding-top: 8px;
+    border-top: 1px solid var(--border);
+    font-size: 11px; color: var(--text2);
+    display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
   }
-  .msg.error {
-    background: #2a1818; border-color: #4a2828; color: #f08080;
+  .msg-stats .stat {
+    display: inline-flex; align-items: center; gap: 4px;
+    background: var(--surface2); border-radius: 99px; padding: 2px 9px;
   }
+  .msg-actions {
+    margin-top: 8px; display: flex; gap: 6px;
+  }
+  .msg-actions button {
+    font-size: 11px; padding: 3px 10px; border-radius: 6px;
+    border: 1px solid var(--border); background: transparent;
+    color: var(--text2); cursor: pointer; transition: all .15s;
+  }
+  .msg-actions button:hover { color: var(--text); border-color: var(--accent); }
+  .msg-actions .copied { color: #2ecc71; border-color: #2ecc71; }
+
+  .status {
+    text-align: center; font-size: 12px; color: var(--text2);
+    padding: 4px 0; display: none;
+  }
+  .status.visible { display: block; }
 
   #input-area {
     padding: 16px 24px;
@@ -108,60 +211,318 @@
   }
   #send-btn:hover { background: var(--accent-hover); }
   #send-btn:disabled { opacity: .4; cursor: not-allowed; }
-
-  .status {
-    text-align: center; font-size: 12px; color: var(--text2);
-    padding: 4px 0; display: none;
+  #stop-btn {
+    padding: 12px 20px; border: 1px solid #e05b5b; border-radius: 12px;
+    background: transparent; color: #e05b5b;
+    font-size: 14px; font-weight: 500; cursor: pointer;
+    display: none; white-space: nowrap;
   }
-  .status.visible { display: block; }
+  #stop-btn:hover { background: rgba(224, 91, 91, .12); }
+
+  #params {
+    display: flex; gap: 16px; align-items: center;
+    padding: 10px 24px; border-top: 1px solid var(--border);
+    background: var(--surface); flex-shrink: 0; flex-wrap: wrap;
+  }
+  .param { display: flex; align-items: center; gap: 8px; font-size: 12px; color: var(--text2); }
+  .param input[type="number"], .param select {
+    width: 70px; padding: 4px 8px; border-radius: 8px;
+    border: 1px solid var(--border); background: var(--bg); color: var(--text);
+    font-size: 12px; font-family: var(--font);
+  }
+  .param select { width: auto; }
+  .param input[type="range"] { width: 90px; accent-color: var(--accent); }
+  .param label { display: flex; align-items: center; gap: 5px; cursor: pointer; }
+  .param label input[type="checkbox"] { accent-color: var(--accent); }
+
+  @media (max-width: 640px) {
+    header { padding: 10px 14px; }
+    #chat-container { padding: 14px; }
+    #input-area { padding: 12px 14px; flex-wrap: wrap; }
+    #send-btn { width: 100%; }
+    .msg { max-width: 100%; }
+  }
 </style>
 </head>
-<body>
+<body data-theme="dark">
 <header>
   <h1>AI Chat</h1>
-  <span class="badge">llm-api</span>
+  <span class="badge" id="model-badge">llm-api</span>
+  <div class="spacer"></div>
+  <button class="header-btn" id="clear-btn" title="Clear conversation">🗑 Clear</button>
+  <button class="header-btn" id="theme-btn" title="Toggle theme">🌙</button>
 </header>
-<div id="chat-container"></div>
+
+<div id="chat-container">
+  <div class="welcome" id="welcome">
+    <h2>MiniCPM5-1B Thinking</h2>
+    <div class="hints">
+      Fast reasoning model running locally via llama.cpp.<br>
+      Markdown &amp; code supported · context window 8K · 1B params (Q8_0)
+    </div>
+  </div>
+</div>
 <div class="status" id="status"></div>
+
+<div id="params">
+  <div class="param">
+    <label title="Enable streaming"><input type="checkbox" id="param-stream" checked> Stream</label>
+  </div>
+  <div class="param" title="Sampling temperature (0 = greedy)">
+    <label for="param-temp">Temp</label>
+    <input type="number" id="param-temp" min="0" max="2" step="0.1" value="0.7">
+  </div>
+  <div class="param" title="Top-p nucleus sampling">
+    <label for="param-topp">Top-P</label>
+    <input type="number" id="param-topp" min="0" max="1" step="0.05" value="0.9">
+  </div>
+  <div class="param" title="Maximum tokens per response">
+    <label for="param-maxtokens">Max tokens</label>
+    <input type="number" id="param-maxtokens" min="16" max="2048" step="16" value="512">
+  </div>
+  <div class="param" title="System prompt for the model">
+    <label for="param-system">System</label>
+    <input type="text" id="param-system" style="width:180px" placeholder="(none)" value="">
+  </div>
+</div>
+
 <div id="input-area">
-  <textarea id="input" rows="1" placeholder="Type your message..."
-    @keydown="if (event.key === 'Enter' && !event.shiftKey) { event.preventDefault(); send() }"></textarea>
-  <button id="send-btn" onclick="send()">Send</button>
+  <textarea id="input" rows="1" placeholder="Type your message... (Enter to send, Shift+Enter for newline)"></textarea>
+  <button id="stop-btn">■ Stop</button>
+  <button id="send-btn">Send</button>
 </div>
 
 <script>
+(function () {
+'use strict';
+
 const CHAT_URL = '/v1/chat/completions';
+const MODELS_URL = '/v1/models';
 const $in = document.getElementById('input');
 const $btn = document.getElementById('send-btn');
+const $stop = document.getElementById('stop-btn');
 const $container = document.getElementById('chat-container');
 const $status = document.getElementById('status');
-let messages = [];
+const $welcome = document.getElementById('welcome');
+const $themeBtn = document.getElementById('theme-btn');
+const $clearBtn = document.getElementById('clear-btn');
+const $modelBadge = document.getElementById('model-badge');
+const $paramStream = document.getElementById('param-stream');
+const $paramTemp = document.getElementById('param-temp');
+const $paramTopp = document.getElementById('param-topp');
+const $paramMax = document.getElementById('param-maxtokens');
+const $paramSystem = document.getElementById('param-system');
 
+let messages = [];
+let modelId = 'minicpm5-1b-fable5-v2-thinking';
+let generating = false;
+let abortCtrl = null;
+
+// ── Theme (persisted) ──
+const savedTheme = localStorage.getItem('llmapi-theme') || 'dark';
+applyTheme(savedTheme);
+$themeBtn.addEventListener('click', () => {
+  const next = document.body.dataset.theme === 'dark' ? 'light' : 'dark';
+  applyTheme(next);
+  localStorage.setItem('llmapi-theme', next);
+});
+function applyTheme(t) {
+  document.body.dataset.theme = t;
+  $themeBtn.textContent = t === 'dark' ? '🌙' : '☀️';
+}
+
+// ── Model discovery ──
+fetch(MODELS_URL).then(r => r.json()).then(d => {
+  if (d && d.data && d.data.length) {
+    modelId = d.data[0].id;
+    $modelBadge.textContent = modelId;
+  }
+}).catch(() => {});
+
+// ── Markdown rendering (small, dependency-free) ──
+// XSS safety: the input is HTML-escaped in full (esc()) BEFORE any markdown
+// transformation; code blocks are escaped individually; links are restricted
+// to http(s) URLs. No raw user/model string ever reaches innerHTML.
+const ESC = { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' };
+function esc(s) { return String(s).replace(/[&<>"']/g, c => ESC[c]); }
+
+function renderMarkdown(src) {
+  let text = String(src);
+
+  // Fenced code blocks — keep raw, escape only the content.
+  const codeBlocks = [];
+  text = text.replace(/```([\w+-]*)\n?([\s\S]*?)```/g, (_, lang, code) => {
+    const i = codeBlocks.length;
+    codeBlocks.push('<pre><code class="lang-' + esc(lang || '') + '">' + esc(code.replace(/\n$/, '')) + '</code></pre>');
+    return '\u0000' + i + '\u0000';
+  });
+
+  // Inline code
+  text = esc(text);
+  text = text.replace(/`([^`\n]+)`/g, (_, c) => '<code>' + c + '</code>');
+
+  // Headings
+  text = text.replace(/^###### (.*)$/gm, '<h6>$1</h6>');
+  text = text.replace(/^##### (.*)$/gm, '<h5>$1</h5>');
+  text = text.replace(/^#### (.*)$/gm, '<h4>$1</h4>');
+  text = text.replace(/^### (.*)$/gm, '<h3>$1</h3>');
+  text = text.replace(/^## (.*)$/gm, '<h2>$1</h2>');
+  text = text.replace(/^# (.*)$/gm, '<h1>$1</h1>');
+
+  // Bold / italic
+  text = text.replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>');
+  text = text.replace(/(^|[^*])\*([^*\n]+)\*/g, '$1<em>$2</em>');
+  text = text.replace(/__([^_]+)__/g, '<strong>$1</strong>');
+  text = text.replace(/~~([^~]+)~~/g, '<del>$1</del>');
+
+  // Links
+  text = text.replace(/\[([^\]]+)\]\((https?:[^)\s]+)\)/g,
+    '<a href="$2" target="_blank" rel="noopener">$1</a>');
+
+  // Blockquotes
+  text = text.replace(/^&gt; (.*)$/gm, '<blockquote>$1</blockquote>');
+
+  // Unordered lists — group consecutive items into ONE <ul>
+  text = text.replace(/(?:^[-*] (.*)$\n?)+/gm, (m) => {
+    const items = m.trim().split('\n').map(l => l.replace(/^[-*] /, '').trim());
+    return '<ul>' + items.map(i => '<li>' + i + '</li>').join('') + '</ul>\n';
+  });
+  // Ordered lists — group consecutive numbered items into ONE <ol>
+  text = text.replace(/(?:^\d+\. (.*)$\n?)+/gm, (m) => {
+    const items = m.trim().split('\n').map(l => l.replace(/^\d+\. /, '').trim());
+    return '<ol>' + items.map(i => '<li>' + i + '</li>').join('') + '</ol>\n';
+  });
+
+  // Tables (simple)
+  text = text.replace(/((?:\|.*\|\n)+)/g, (m) => {
+    const rows = m.trim().split('\n').filter(r => r.trim());
+    if (rows.length < 1) return m;
+    let html = '<table>';
+    rows.forEach((row, i) => {
+      if (/^\|?\s*:?-+:?\s*(\|\s*:?-+:?\s*)*\|?$/.test(row.trim())) return; // separator
+      const cells = row.replace(/^\||\|$/g, '').split('|').map(c => c.trim());
+      const tag = i === 0 ? 'th' : 'td';
+      html += '<tr>' + cells.map(c => '<' + tag + '>' + c + '</' + tag + '>').join('') + '</tr>';
+    });
+    return html + '</table>';
+  });
+
+  // Paragraphs (split double newlines)
+  text = text.split(/\n{2,}/).map(p => {
+    const t = p.trim();
+    if (!t) return '';
+    if (/^<(h\d|ul|ol|blockquote|pre|table)/.test(t)) return t;
+    return '<p>' + t.replace(/\n/g, '<br>') + '</p>';
+  }).join('\n');
+
+  // Restore code blocks
+  text = text.replace(/\u0000(\d+)\u0000/g, (_, i) => codeBlocks[+i] || '');
+
+  return text;
+}
+
+function formatNumber(n) {
+  if (n == null) return '—';
+  if (n >= 1e6) return (n / 1e6).toFixed(1) + 'M';
+  if (n >= 1e3) return (n / 1e3).toFixed(1) + 'K';
+  return String(Math.round(n));
+}
+
+// ── Message rendering ──
 function addMsg(role, text, extra) {
+  extra = extra || {};
   const el = document.createElement('div');
   el.className = 'msg ' + role;
-  if (extra?.error) el.classList.add('error');
-  if (text) el.textContent = text;
-  if (extra?.toolCalls?.length) {
-    for (const tc of extra.toolCalls) {
-      const t = document.createElement('div');
-      t.className = 'tool-call';
-      t.textContent = tc.function?.name || 'tool call';
-      el.appendChild(t);
+  if (extra.error) el.classList.add('error');
+
+  if (role === 'assistant' && !extra.error) {
+    const md = document.createElement('div');
+    md.className = 'md';
+    el.appendChild(md);
+
+    if (extra.reasoning) {
+      const details = document.createElement('details');
+      details.className = 'reasoning';
+      details.open = false;
+      const sum = document.createElement('summary');
+      sum.textContent = 'Thinking';
+      const body = document.createElement('div');
+      body.className = 'reasoning-body';
+      body.textContent = extra.reasoning;
+      details.appendChild(sum);
+      details.appendChild(body);
+      el.appendChild(details);
     }
+
+    if (extra.toolCalls && extra.toolCalls.length) {
+      for (const tc of extra.toolCalls) {
+        const t = document.createElement('div');
+        t.className = 'tool-call';
+        t.textContent = 'Calling tool: ' + (tc.function && tc.function.name || 'tool');
+        el.appendChild(t);
+      }
+    }
+
+    // Live content element
+    const content = document.createElement('div');
+    content.className = 'md-content';
+    md.appendChild(content);
+
+    el._md = content;
+
+    // Actions (copy)
+    const actions = document.createElement('div');
+    actions.className = 'msg-actions';
+    const copyBtn = document.createElement('button');
+    copyBtn.textContent = '📋 Copy';
+    copyBtn.addEventListener('click', () => {
+      navigator.clipboard.writeText(extra.copyText || text || '').then(() => {
+        copyBtn.textContent = '✓ Copied';
+        copyBtn.classList.add('copied');
+        setTimeout(() => { copyBtn.textContent = '📋 Copy'; copyBtn.classList.remove('copied'); }, 1500);
+      });
+    });
+    actions.appendChild(copyBtn);
+    el.appendChild(actions);
+  } else {
+    if (text) el.textContent = text;
   }
+
   $container.appendChild(el);
-  el.scrollIntoView({ behavior: 'smooth' });
+  $welcome.style.display = 'none';
+  el.scrollIntoView({ behavior: 'smooth', block: 'end' });
   return el;
+}
+
+function setContent(el, html) {
+  if (el) el.innerHTML = html || '';
+}
+
+// ── Conversation ──
+function buildRequestBody() {
+  const body = {
+    model: modelId,
+    messages: [],
+    stream: $paramStream.checked,
+    max_tokens: parseInt($paramMax.value, 10) || 512,
+  };
+  const temp = parseFloat($paramTemp.value);
+  if (!isNaN(temp)) body.temperature = temp;
+  const topp = parseFloat($paramTopp.value);
+  if (!isNaN(topp)) body.top_p = topp;
+  const sys = $paramSystem.value.trim();
+  if (sys) body.messages.push({ role: 'system', content: sys });
+  body.messages = body.messages.concat(messages.slice(-12));
+  return body;
 }
 
 async function send() {
   const text = $in.value.trim();
-  if (!text || $btn.disabled) return;
+  if (!text || generating) return;
 
   $in.value = '';
   $in.style.height = 'auto';
-  $btn.disabled = true;
+  setGenerating(true);
   $status.className = 'status visible';
   $status.textContent = 'AI is thinking...';
 
@@ -169,56 +530,59 @@ async function send() {
   addMsg('user', text);
 
   const el = addMsg('assistant', '');
+  const started = Date.now();
+  let full = '';
+  let reasoning = '';
+  let toolCalls = null;
+  let lastUsage = null;
+
+  abortCtrl = new AbortController();
+  const body = buildRequestBody();
 
   try {
     const res = await fetch(CHAT_URL, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        model: 'minicpm5-1b-fable5-v2-thinking',
-        messages: messages.slice(-5),  // keep context window manageable
-        stream: true,
-        max_tokens: 1024,
-      }),
+      body: JSON.stringify(body),
+      signal: abortCtrl.signal,
     });
 
     if (!res.ok) {
-      const errText = await res.text().catch(() => 'Unknown error');
-      el.textContent = `Error ${res.status}: ${errText}`;
+      let errText = '';
+      try { const j = await res.json(); errText = j.error && j.error.message || JSON.stringify(j); }
+      catch (e) { errText = await res.text().catch(() => 'Unknown error'); }
       el.classList.add('error');
+      setContent(el._md, esc('Error ' + res.status + ': ' + errText));
       return;
     }
 
+    // Non-streaming response
+    if (!body.stream) {
+      const data = await res.json();
+      const choice = data.choices && data.choices[0];
+      if (choice) {
+        const msg = choice.message || {};
+        reasoning = msg.reasoning_content || '';
+        full = msg.content || '';
+        toolCalls = msg.tool_calls || null;
+        lastUsage = data.usage || null;
+        if (choice.finish_reason === 'tool_calls' && toolCalls) {
+          full = full + '\n\n<em>[tool calls emitted — see logs]</em>';
+        }
+      }
+      el._reasoning = reasoning;
+      renderMessage(el, full, reasoning, toolCalls, lastUsage, started);
+      if (full) messages.push({ role: 'assistant', content: full });
+      return;
+    }
+
+    // Streaming
     const reader = res.body.getReader();
     const decoder = new TextDecoder();
     let buffer = '';
-    let full = '';
-    let reasoning = '';
-    let toolCalls = null;
 
-    // Re-render the assistant bubble: reasoning (muted) above the answer.
-    function render() {
-      el.innerHTML = '';
-      if (reasoning) {
-        const r = document.createElement('div');
-        r.className = 'reasoning';
-        r.textContent = reasoning;
-        el.appendChild(r);
-      }
-      if (full) {
-        const c = document.createElement('div');
-        c.textContent = full;
-        el.appendChild(c);
-      }
-      if (toolCalls?.length) {
-        for (const tc of toolCalls) {
-          const t = document.createElement('div');
-          t.className = 'tool-call';
-          t.textContent = 'Calling tool: ' + (tc.function?.name || 'tool');
-          el.appendChild(t);
-        }
-      }
-    }
+    $status.textContent = 'Receiving...';
+    $stop.style.display = 'inline-block';
 
     while (true) {
       const { done, value } = await reader.read();
@@ -235,46 +599,134 @@ async function send() {
 
         try {
           const chunk = JSON.parse(data);
-          const delta = chunk.choices?.[0]?.delta;
-          const finish = chunk.choices?.[0]?.finish_reason;
-
-          if (delta?.reasoning_content) {
-            reasoning += delta.reasoning_content;
-            render();
+          const delta = chunk.choices && chunk.choices[0] && chunk.choices[0].delta;
+          if (delta) {
+            if (delta.reasoning_content) { reasoning += delta.reasoning_content; }
+            if (delta.content) { full += delta.content; }
+            if (delta.tool_calls) { toolCalls = delta.tool_calls; }
           }
-          if (delta?.content) {
-            full += delta.content;
-            render();
-          }
-          if (delta?.tool_calls) {
-            toolCalls = delta.tool_calls;
-            render();
-          }
-          if (finish === 'tool_calls') {
-            render();
-          }
+          if (chunk.usage) lastUsage = chunk.usage;
         } catch (e) { /* skip malformed chunk */ }
       }
+
+      renderMessage(el, full, reasoning, toolCalls, lastUsage, started, true);
     }
 
+    renderMessage(el, full, reasoning, toolCalls, lastUsage, started, false);
     if (full) messages.push({ role: 'assistant', content: full });
-    $status.className = 'status';
   } catch (e) {
-    el.textContent = 'Network error: ' + e.message;
-    el.classList.add('error');
+    if (e.name === 'AbortError') {
+      el._md.textContent = '';
+      el._md.textContent = full || '(stopped)';
+      renderMessage(el, full, reasoning, toolCalls, lastUsage, started, false);
+      messages.push({ role: 'assistant', content: full });
+      $status.textContent = 'Stopped.';
+    } else {
+      el.classList.add('error');
+      setContent(el._md, esc('Network error: ' + e.message));
+      $status.textContent = 'Error';
+    }
   } finally {
-    $btn.disabled = false;
+    setGenerating(false);
+    $stop.style.display = 'none';
     $status.className = 'status';
     $in.focus();
   }
 }
+
+function renderMessage(el, full, reasoning, toolCalls, usage, started, live) {
+  // Reasoning: first non-live render creates the collapsible; during streaming
+  // keep it updated.
+  const finalReasoning = reasoning && reasoning.trim() ? reasoning : '';
+  if (finalReasoning && !el._reasoningEl) {
+    const details = document.createElement('details');
+    details.className = 'reasoning';
+    details.open = false;
+    const sum = document.createElement('summary');
+    sum.textContent = 'Thinking';
+    const body = document.createElement('div');
+    body.className = 'reasoning-body';
+    details.appendChild(sum);
+    details.appendChild(body);
+    el._reasoningEl = details;
+    el._reasoningBody = body;
+    el.insertBefore(details, el._md.parentNode || el.firstChild);
+  }
+  if (el._reasoningBody) el._reasoningBody.textContent = finalReasoning;
+
+  setContent(el._md, full ? renderMarkdown(full) : (live ? '<span class="cursor">▊</span>' : ''));
+
+  // Tool calls
+  if (toolCalls && toolCalls.length && !el._toolRendered) {
+    el._toolRendered = true;
+    for (const tc of toolCalls) {
+      const t = document.createElement('div');
+      t.className = 'tool-call';
+      t.textContent = 'Calling tool: ' + ((tc.function && tc.function.name) || 'tool');
+      el.appendChild(t);
+    }
+  }
+
+  // Stats — only when generation finished.
+  if (!live && (full || usage)) {
+    renderStats(el, usage, started);
+  }
+}
+
+function renderStats(el, usage, started) {
+  const elapsed = Date.now() - started;
+  if (el._statsEl) el._statsEl.remove();
+
+  const stats = document.createElement('div');
+  stats.className = 'msg-stats';
+  const add = (label, val) => {
+    const s = document.createElement('span');
+    s.className = 'stat';
+    s.textContent = label + ' ' + val;
+    stats.appendChild(s);
+  };
+
+  const dur = usage && usage.duration_ms ? usage.duration_ms : elapsed;
+  add('⏱', (dur / 1000).toFixed(1) + 's');
+  if (usage && usage.tokens_per_second) add('⚡', usage.tokens_per_second.toFixed(1) + ' tok/s');
+  if (usage) {
+    add('📝', formatNumber(usage.prompt_tokens) + ' in / ' + formatNumber(usage.completion_tokens) + ' out');
+    add('Σ', formatNumber(usage.total_tokens) + ' tok');
+  }
+  el.appendChild(stats);
+}
+
+function setGenerating(v) {
+  generating = v;
+  $btn.disabled = v;
+  $btn.textContent = v ? 'Generating…' : 'Send';
+}
+
+$stop.addEventListener('click', () => {
+  if (abortCtrl) abortCtrl.abort();
+});
+
+$clearBtn.addEventListener('click', () => {
+  messages = [];
+  $container.querySelectorAll('.msg').forEach(el => el.remove());
+  $welcome.style.display = '';
+  $in.focus();
+});
 
 // Auto-resize textarea
 $in.addEventListener('input', () => {
   $in.style.height = 'auto';
   $in.style.height = Math.min($in.scrollHeight, 160) + 'px';
 });
+$in.addEventListener('keydown', (e) => {
+  if (e.key === 'Enter' && !e.shiftKey) {
+    e.preventDefault();
+    send();
+  }
+});
 $in.focus();
+
+})();
 </script>
 </body>
 </html>
